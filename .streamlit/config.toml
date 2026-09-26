@@ -1,3 +1,5 @@
-[theme]
+[theme.light]
 primaryColor = "#2a78d6"
-font = "sans serif"
+
+[theme.dark]
+primaryColor = "#3987e5"
