@@ -23,25 +23,12 @@ DATA = Path(__file__).parent / "data"
 TZ = ZoneInfo("Pacific/Auckland")
 
 
-# ---------- theme tokens (validated reference palette, light + dark steps) ----------
-def is_dark() -> bool:
-    try:
-        return st.context.theme.type == "dark"
-    except Exception:
-        return False
-
-
-DARK = is_dark()
-if DARK:
-    T = dict(surface="#1a1a19", card="#232322", sidebar="#141413", ink="#ffffff", ink2="#c3c2b7", muted="#898781",
-             grid="#2c2c2a", mid="#383835",
-             series=["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
-             bands=["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#1c5cab", "#184f95"])
-else:
-    T = dict(surface="#fcfcfb", card="#ffffff", sidebar="#f3f2ee", ink="#0b0b0b", ink2="#52514e", muted="#898781",
-             grid="#e1e0d9", mid="#f0efec",
-             series=["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
-             bands=["#86b6ef", "#6da7ec", "#5598e7", "#2a78d6", "#256abf", "#184f95", "#0d366b"])
+# ---------- palette (validated reference palette) ----------
+# Chart text, gridlines and backgrounds come from Streamlit's own Plotly theme, so they follow the
+# viewer's light/dark setting automatically; only data colours are fixed here (they read on both).
+T = dict(muted="#898781", mid="#a8a7a0", sep="rgba(128,128,128,0.35)",
+         series=["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
+         bands=["#86b6ef", "#6da7ec", "#5598e7", "#2a78d6", "#256abf", "#184f95", "#0d366b"])
 
 SERIES = T["series"]
 # Age bands are ordered -> one sequential hue, light (young) to dark (old)
@@ -56,10 +43,9 @@ st.html(f"""
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
 html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSidebar"] {{font-family: 'Inter', system-ui, sans-serif;}}
 .block-container {{padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px;}}
-[data-testid="stMetric"] {{background: {T["card"]}; box-shadow: 0 1px 2px rgba(0,0,0,.05);}}
-[data-testid="stMetricLabel"] p {{font-size: .82rem; color: {T["ink2"]}; font-weight: 500;}}
+[data-testid="stMetric"] {{box-shadow: 0 1px 2px rgba(0,0,0,.05);}}
+[data-testid="stMetricLabel"] p {{font-size: .82rem; opacity: .8; font-weight: 500;}}
 [data-testid="stMetricValue"] {{font-weight: 700; letter-spacing: -.02em;}}
-[data-testid="stSidebar"] {{background: {T["sidebar"]};}}
 .hero {{background: linear-gradient(120deg, #0d366b 0%, #1c5cab 55%, #2a78d6 100%); color: #fff;
         border-radius: 1rem; padding: 1.4rem 1.8rem; margin-bottom: .4rem;}}
 .hero .eyebrow {{font-size: .78rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; opacity: .75;}}
@@ -76,19 +62,18 @@ html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSideb
 
 PLOT_CFG = {"displayModeBar": False, "responsive": True}
 LAYOUT = dict(
-    font=dict(family="Inter, system-ui, sans-serif", size=13, color=T["ink2"]),
+    font=dict(family="Inter, system-ui, sans-serif", size=13),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
     margin=dict(l=10, r=10, t=50, b=10), hovermode="x unified",
-    hoverlabel=dict(bgcolor=T["card"], bordercolor=T["grid"], font=dict(color=T["ink"])),
-    legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, title=None, font=dict(color=T["ink2"])),
+    legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, title=None),
 )
 
 
 def style(fig, height=380, title=None):
     fig.update_layout(**LAYOUT, height=height,
-                      title=dict(text=title, font=dict(size=15, color=T["ink"])) if title else None)
-    fig.update_xaxes(gridcolor=T["grid"], linecolor=T["grid"], zeroline=False, title_font_color=T["muted"])
-    fig.update_yaxes(gridcolor=T["grid"], linecolor=T["grid"], zeroline=False, title_font_color=T["muted"])
+                      title=dict(text=title, font=dict(size=15)) if title else None)
+    fig.update_xaxes(zeroline=False)
+    fig.update_yaxes(zeroline=False)
     return fig
 
 
@@ -218,7 +203,7 @@ def page_overview():
     share = by_band.assign(pct=by_band.n / by_band.groupby("year").n.transform("sum") * 100)
     fig = px.bar(share, x="year", y="pct", color="band", category_orders={"band": BANDS},
                  color_discrete_map=BAND_MAP, labels={"pct": "% of members", "year": "", "band": "Age"})
-    fig.update_traces(marker_line_width=0.5, marker_line_color=T["surface"], hovertemplate="%{y:.1f}%")
+    fig.update_traces(marker_line_width=0.5, marker_line_color=T["sep"], hovertemplate="%{y:.1f}%")
     fig.update_layout(bargap=0.15)
     card(c2, style(fig, title="Age mix (share of members)"))
 
@@ -227,7 +212,7 @@ def page_overview():
     c3, c4 = st.columns([2, 3])
     fig = go.Figure(go.Bar(x=growth.values, y=BANDS, orientation="h", marker_color=[BAND_MAP[b] for b in BANDS],
                            text=[f"{v:+.0f}%" for v in growth.values], textposition="outside", cliponaxis=False,
-                           textfont=dict(color=T["ink2"]), hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
+                           hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
     fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"),
                       xaxis=dict(range=[min(0, growth.min() * 1.25), growth.max() * 1.2]))
     card(c3, style(fig, title=f"Growth by age group, {first}→{last}"))
@@ -353,7 +338,7 @@ def page_compare():
     hb = ((hb[last] / hb[first] - 1) * 100).unstack("band").reindex(columns=BANDS)
     lim = float(np.nanpercentile(np.abs(hb.values), 95)) or 1
     fig = px.imshow(hb, text_auto=".0f", aspect="auto", zmin=-lim, zmax=lim,
-                    color_continuous_scale=[[0, "#d03b3b"], [0.5, T["mid"]], [1, "#3987e5" if DARK else "#1c5cab"]],
+                    color_continuous_scale=[[0, "#d03b3b"], [0.5, T["mid"]], [1, "#2a78d6"]],
                     labels=dict(color="Growth %", x="Age group", y=""))
     fig.update_layout(hovermode="closest")
     card(st, style(fig, 360, f"Growth % by age group, {first}→{last}"))
@@ -375,9 +360,9 @@ def page_pyramid():
                 hovertemplate="%{y}: %{x:,}<extra>Female</extra>")
     if py != first:
         fig.add_scatter(y=[lab(a) for a in ref.index], x=-ref.get("M", 0), mode="lines", name=f"{first} outline",
-                        line=dict(color=T["ink"], width=1.5, shape="hvh"), hoverinfo="skip")
+                        line=dict(color=T["muted"], width=2, shape="hvh"), hoverinfo="skip")
         fig.add_scatter(y=[lab(a) for a in ref.index], x=ref.get("F", 0), mode="lines", showlegend=False,
-                        line=dict(color=T["ink"], width=1.5, shape="hvh"), hoverinfo="skip")
+                        line=dict(color=T["muted"], width=2, shape="hvh"), hoverinfo="skip")
     mx = max(cur.max().max(), ref.max().max()) * 1.1
     ticks = np.linspace(-mx, mx, 7).round(-3)
     fig.update_layout(barmode="overlay", bargap=0.1, hovermode="closest",
@@ -403,7 +388,7 @@ def page_churches():
                      color_discrete_map={g: SERIES[i % 8] for i, g in enumerate(sorted(churches.denomination.unique()))},
                      hover_name="church_name", size_max=22, opacity=0.8,
                      labels={"median_age": f"Median age ({last})", "growth_pct": f"Growth % {first}→{last}", "denomination": ""})
-    fig.update_traces(marker=dict(line=dict(width=1, color=T["surface"])))
+    fig.update_traces(marker=dict(line=dict(width=0.5, color=T["sep"])))
     fig.add_hline(y=0, line_color=T["muted"], line_width=1, line_dash="dot")
     fig.update_layout(hovermode="closest")
     card(c1, style(fig, 480, "Every church: age vs growth"))
@@ -442,7 +427,7 @@ def page_profile():
     c1, c2 = st.columns(2)
     fig = px.bar(ob, x="year", y="n", color="band", category_orders={"band": BANDS}, color_discrete_map=BAND_MAP,
                  labels={"n": "Members", "year": "", "band": "Age"})
-    fig.update_traces(marker_line_width=0.5, marker_line_color=T["surface"])
+    fig.update_traces(marker_line_width=0.5, marker_line_color=T["sep"])
     card(c1, style(fig, title="Members by age group"))
     om = median_by(one, ["year"])
     allm = med.reset_index().assign(who="All filtered churches")
