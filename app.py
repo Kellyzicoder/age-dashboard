@@ -15,6 +15,36 @@ st.set_page_config(page_title="Age Dashboard", page_icon="⛪", layout="wide")
 
 DATA = Path(__file__).parent / "data"
 
+# ---------- look & feel ----------
+st.html("""
+<style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
+html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSidebar"] {font-family: 'Inter', system-ui, sans-serif;}
+.block-container {padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px;}
+[data-testid="stMetric"] {background: #ffffff; box-shadow: 0 1px 2px rgba(11,11,11,.04);}
+[data-testid="stMetricLabel"] p {font-size: .82rem; color: #52514e; font-weight: 500;}
+[data-testid="stMetricValue"] {font-weight: 700; letter-spacing: -.02em;}
+[data-testid="stVerticalBlockBorderWrapper"] {background: #ffffff;}
+.stTabs [data-baseweb="tab-list"] {gap: .25rem;}
+.stTabs [data-baseweb="tab"] {padding: .5rem 1rem; border-radius: .6rem .6rem 0 0; font-weight: 500;}
+[data-testid="stSidebar"] {background: #f3f2ee;}
+.hero {background: linear-gradient(120deg, #0d366b 0%, #1c5cab 55%, #2a78d6 100%); color: #fff;
+       border-radius: 1rem; padding: 1.6rem 1.8rem; margin-bottom: .4rem;}
+.hero h1 {font-size: 2rem; font-weight: 800; margin: 0; letter-spacing: -.02em; color: #fff;}
+.hero p {margin: .35rem 0 .9rem; opacity: .88; font-size: .98rem;}
+.chip {display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28);
+       border-radius: 999px; padding: .2rem .7rem; margin: 0 .35rem .35rem 0; font-size: .8rem; font-weight: 500;}
+</style>
+""")
+
+PLOT_CFG = {"displayModeBar": False, "responsive": True}
+
+
+def card(where, fig):
+    """Render a Plotly figure inside a bordered card."""
+    with where.container(border=True):
+        st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
+
 # ---------- palette (validated reference palette; see README) ----------
 INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
 SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
@@ -114,8 +144,12 @@ if f.empty:
 first, last = int(f.year.min()), int(f.year.max())
 
 # ---------- header + KPIs ----------
-st.title("Age Dashboard")
-st.caption(f"How congregations are growing — and ageing — across {f.church_id.nunique():,} churches, {first}–{last}")
+chips = [f"{first}–{last}", ", ".join(regions) or "All regions", ", ".join(denoms) or "All denominations",
+         ", ".join(settings) or "Urban, peri-urban & rural", {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
+st.html(
+    '<div class="hero"><h1>⛪ Age Dashboard</h1>'
+    f'<p>How congregations are growing — and ageing — across {f.church_id.nunique():,} churches</p>'
+    + "".join(f'<span class="chip">{c}</span>' for c in chips) + "</div>")
 
 tot = f.groupby("year").n.sum()
 med = median_by(f, ["year"]).set_index("year").median_age
@@ -123,12 +157,20 @@ youth = f[f.band.isin(YOUTH_BANDS)].groupby("year").n.sum() / tot
 old = f[f.band == "65+"].groupby("year").n.sum() / tot
 prev = last - 1 if last - 1 in tot.index else last
 
+growth_idx = (tot / tot[first] - 1) * 100
+spark = dict(border=True, chart_type="line")
 k = st.columns(5)
-k[0].metric(f"Members ({last})", f"{tot[last]:,}", f"{(tot[last]/tot[prev]-1):+.1%} vs {prev}" if prev != last else None)
-k[1].metric(f"Growth since {first}", f"{(tot[last]/tot[first]-1):+.1%}", f"{tot[last]-tot[first]:+,} members", delta_color="off")
-k[2].metric("Median age", f"{med[last]:.0f} yrs", f"{med[last]-med[first]:+.0f} since {first}", delta_color="inverse")
-k[3].metric("Under 25 share", f"{youth[last]:.1%}", f"{(youth[last]-youth[first])*100:+.1f} pts")
-k[4].metric("65+ share", f"{old[last]:.1%}", f"{(old[last]-old[first])*100:+.1f} pts", delta_color="inverse")
+k[0].metric(f"Members ({last})", f"{tot[last]:,}", f"{(tot[last]/tot[prev]-1):+.1%} vs {prev}" if prev != last else None,
+            chart_data=tot.tolist(), **spark)
+k[1].metric(f"Growth since {first}", f"{(tot[last]/tot[first]-1):+.1%}", f"{tot[last]-tot[first]:+,} members",
+            delta_color="off", chart_data=growth_idx.round(1).tolist(), **spark)
+k[2].metric("Median age", f"{med[last]:.0f} yrs", f"{med[last]-med[first]:+.0f} since {first}", delta_color="inverse",
+            chart_data=med.tolist(), **spark)
+k[3].metric("Under 25 share", f"{youth[last]:.1%}", f"{(youth[last]-youth[first])*100:+.1f} pts",
+            chart_data=(youth * 100).round(1).tolist(), **spark)
+k[4].metric("65+ share", f"{old[last]:.1%}", f"{(old[last]-old[first])*100:+.1f} pts", delta_color="inverse",
+            chart_data=(old * 100).round(1).tolist(), **spark)
+st.write("")
 
 tabs = st.tabs(["📈 Overview", "🧭 Compare groups", "👥 Age pyramid", "🏛️ Churches", "🔎 Church profile"])
 
@@ -138,15 +180,15 @@ with tabs[0]:
     c1, c2 = st.columns([3, 2])
     fig = px.area(by_band, x="year", y="n", color="band", category_orders={"band": BANDS},
                   color_discrete_map=BAND_MAP, labels={"n": "Members", "year": "", "band": "Age"})
-    fig.update_traces(line=dict(width=0.5))
-    c1.plotly_chart(style(fig, title="Members by age group"), use_container_width=True)
+    fig.for_each_trace(lambda t: t.update(fillcolor=BAND_MAP[t.name], line=dict(color=BAND_MAP[t.name], width=0.5)))
+    card(c1, style(fig, title="Members by age group"))
 
     share = by_band.assign(pct=by_band.n / by_band.groupby("year").n.transform("sum") * 100)
     fig = px.bar(share, x="year", y="pct", color="band", category_orders={"band": BANDS},
                  color_discrete_map=BAND_MAP, labels={"pct": "% of members", "year": "", "band": "Age"})
     fig.update_traces(marker_line_width=0.5, marker_line_color="#fcfcfb", hovertemplate="%{y:.1f}%")
     fig.update_layout(bargap=0.15)
-    c2.plotly_chart(style(fig, title="Age mix (share of members)"), use_container_width=True)
+    card(c2, style(fig, title="Age mix (share of members)"))
 
     # growth by band: indexed to first year
     piv = by_band.pivot(index="year", columns="band", values="n")
@@ -157,12 +199,12 @@ with tabs[0]:
                            text=[f"{v:+.0f}%" for v in growth.values], textposition="outside",
                            hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
     fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"))
-    c3.plotly_chart(style(fig, title=f"Growth by age group, {first}→{last}"), use_container_width=True)
+    card(c3, style(fig, title=f"Growth by age group, {first}→{last}"))
 
     mdf = med.reset_index()
     fig = px.line(mdf, x="year", y="median_age", markers=True, labels={"median_age": "Median age", "year": ""})
     fig.update_traces(line=dict(width=2, color=SERIES[0]), marker=dict(size=8))
-    c4.plotly_chart(style(fig, title="Median member age"), use_container_width=True)
+    card(c4, style(fig, title="Median member age"))
 
 # ---------- Compare groups ----------
 with tabs[1]:
@@ -175,7 +217,7 @@ with tabs[1]:
     fig = px.line(md, x="year", y="median_age", color=dim, color_discrete_map=cmap, markers=True,
                   labels={"median_age": "Median age", "year": "", dim: ""})
     fig.update_traces(line_width=2, marker_size=7)
-    c1.plotly_chart(style(fig, 420, "Median age over time"), use_container_width=True)
+    card(c1, style(fig, 420, "Median age over time"))
 
     t = f.groupby(["year", dim]).n.sum().reset_index()
     base = t[t.year == first].set_index(dim).n
@@ -184,7 +226,7 @@ with tabs[1]:
                   labels={"index": f"Members (index, {first}=100)", "year": "", dim: ""})
     fig.update_traces(line_width=2, marker_size=7)
     fig.add_hline(y=100, line_color=MUTED, line_width=1, line_dash="dot")
-    c2.plotly_chart(style(fig, 420, "Membership growth (indexed)"), use_container_width=True)
+    card(c2, style(fig, 420, "Membership growth (indexed)"))
 
     # heatmap: growth % by group × age band (diverging blue<->red, grey midpoint)
     hb = f[f.year.isin([first, last])].groupby([dim, "band", "year"], observed=True).n.sum().unstack("year")
@@ -194,7 +236,7 @@ with tabs[1]:
                     color_continuous_scale=[[0, "#d03b3b"], [0.5, "#f0efec"], [1, "#1c5cab"]],
                     labels=dict(color="Growth %", x="Age group", y=""))
     fig.update_layout(hovermode="closest")
-    st.plotly_chart(style(fig, 360, f"Growth % by age group, {first}→{last}"), use_container_width=True)
+    card(st, style(fig, 360, f"Growth % by age group, {first}→{last}"))
 
 # ---------- Age pyramid ----------
 with tabs[2]:
@@ -223,7 +265,7 @@ with tabs[2]:
     fig.update_layout(barmode="overlay", bargap=0.1, hovermode="closest",
                       xaxis=dict(range=[-mx, mx], tickformat=",", title="Members"))
     fig.update_xaxes(tickvals=np.linspace(-mx, mx, 7).round(-3), ticktext=[f"{abs(v):,.0f}" for v in np.linspace(-mx, mx, 7).round(-3)])
-    st.plotly_chart(style(fig, 560, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")), use_container_width=True)
+    card(st, style(fig, 560, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")))
 
 # ---------- Churches ----------
 with tabs[3]:
@@ -246,21 +288,21 @@ with tabs[3]:
     fig.update_traces(marker=dict(line=dict(width=1, color="#fcfcfb")))
     fig.add_hline(y=0, line_color=MUTED, line_width=1, line_dash="dot")
     fig.update_layout(hovermode="closest")
-    c1.plotly_chart(style(fig, 460, "Every church: age vs growth"), use_container_width=True)
+    card(c1, style(fig, 460, "Every church: age vs growth"))
 
     with c2:
         st.markdown("**Fastest growing**")
         st.dataframe(tbl.nlargest(8, "growth_pct")[["church_name", "region", "growth_pct"]],
-                     hide_index=True, use_container_width=True,
+                     hide_index=True, width="stretch",
                      column_config={"growth_pct": st.column_config.NumberColumn("Growth", format="%+.0f%%")})
         st.markdown("**Ageing fastest** (median age rise)")
         st.dataframe(tbl.nlargest(8, "median_age_change")[["church_name", "region", "median_age_change"]],
-                     hide_index=True, use_container_width=True,
+                     hide_index=True, width="stretch",
                      column_config={"median_age_change": st.column_config.NumberColumn("Δ median age", format="%+.0f yrs")})
 
     q = st.text_input("Search churches", placeholder="Name, region or denomination…")
     show = tbl if not q else tbl[tbl.apply(lambda r: q.lower() in f"{r.church_name} {r.region} {r.denomination}".lower(), axis=1)]
-    st.dataframe(show.sort_values("growth_pct", ascending=False), hide_index=True, use_container_width=True, height=420,
+    st.dataframe(show.sort_values("growth_pct", ascending=False), hide_index=True, width="stretch", height=420,
                  column_config={
                      "growth_pct": st.column_config.NumberColumn("Growth %", format="%+.1f%%"),
                      "youth_share": st.column_config.ProgressColumn("Under 25", format="percent", min_value=0, max_value=1),
@@ -281,13 +323,13 @@ with tabs[4]:
     fig = px.bar(ob, x="year", y="n", color="band", category_orders={"band": BANDS}, color_discrete_map=BAND_MAP,
                  labels={"n": "Members", "year": "", "band": "Age"})
     fig.update_traces(marker_line_width=0.5, marker_line_color="#fcfcfb")
-    c1.plotly_chart(style(fig, title="Members by age group"), use_container_width=True)
+    card(c1, style(fig, title="Members by age group"))
     om = median_by(one, ["year"])
     allm = med.reset_index().assign(who="All filtered churches")
     fig = px.line(pd.concat([om.assign(who=opts[cid]), allm]), x="year", y="median_age", color="who", markers=True,
                   color_discrete_sequence=[SERIES[1], MUTED], labels={"median_age": "Median age", "year": "", "who": ""})
     fig.update_traces(line_width=2, marker_size=7)
-    c2.plotly_chart(style(fig, title="Median age vs all churches"), use_container_width=True)
+    card(c2, style(fig, title="Median age vs all churches"))
 
 with st.expander("About this data"):
     st.markdown(
