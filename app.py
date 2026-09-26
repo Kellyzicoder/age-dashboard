@@ -74,6 +74,8 @@ def style(fig, height=380, title=None):
                       title=dict(text=title, font=dict(size=15)) if title else None)
     fig.update_xaxes(zeroline=False)
     fig.update_yaxes(zeroline=False)
+    if fig.layout.xaxis.title.text:  # leave room for the x-axis title above a bottom legend
+        fig.update_layout(legend_y=-0.3)
     return fig
 
 
