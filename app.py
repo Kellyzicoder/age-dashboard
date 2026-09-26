@@ -28,8 +28,8 @@ YOUTH_BANDS = BANDS[:3]  # under 25
 LAYOUT = dict(
     font=dict(family="Inter, system-ui, sans-serif", size=13, color=INK2),
     paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    margin=dict(l=10, r=10, t=40, b=10), hovermode="x unified",
-    legend=dict(orientation="h", yanchor="bottom", y=1.02, x=0, title=None),
+    margin=dict(l=10, r=10, t=50, b=10), hovermode="x unified",
+    legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, title=None),
     xaxis=dict(gridcolor=GRID, linecolor=GRID, tickcolor=GRID, zeroline=False),
     yaxis=dict(gridcolor=GRID, linecolor=GRID, zeroline=False),
 )
@@ -138,7 +138,7 @@ with tabs[0]:
     c1, c2 = st.columns([3, 2])
     fig = px.area(by_band, x="year", y="n", color="band", category_orders={"band": BANDS},
                   color_discrete_map=BAND_MAP, labels={"n": "Members", "year": "", "band": "Age"})
-    fig.update_traces(line=dict(width=1, color="#fcfcfb"))
+    fig.update_traces(line=dict(width=0.5))
     c1.plotly_chart(style(fig, title="Members by age group"), use_container_width=True)
 
     share = by_band.assign(pct=by_band.n / by_band.groupby("year").n.transform("sum") * 100)
