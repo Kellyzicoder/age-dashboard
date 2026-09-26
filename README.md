@@ -3,17 +3,25 @@
 Interactive Streamlit dashboard showing how membership and the **age profile** of
 **1,000 churches** changed from 2015 to 2026, built on **~512,000 member records**.
 
+**Live:** https://kelly-age-dashboard.streamlit.app
+
 ## What's inside
 
-| Tab | Shows |
+Pages (sidebar navigation, filters shared across all pages):
+
+| Page | Shows |
 |---|---|
-| Overview | Members by age group over time, age mix %, growth by age group, median age trend |
+| Overview | KPI cards with sparklines, members by age group, age mix %, growth by age group, median age trend |
+| Live activity | Real-time feed of members joining/leaving, refreshing every few seconds |
 | Compare groups | Median age & indexed growth by region / denomination / setting, growth heatmap |
 | Age pyramid | Male/female pyramid for any year, with the first year as an outline |
-| Churches | Every church plotted age vs growth, top lists, searchable table, CSV download |
+| All churches | Every church plotted age vs growth, top lists, searchable table, CSV download |
 | Church profile | Drill into a single church vs the overall average |
+| About the data | Data source and how to plug in your own |
 
 Filters (sidebar): year range, region, denomination, urban/rural setting, gender.
+
+Light and dark mode follow your system, or switch via ⋮ → Settings → Theme.
 
 ## Run locally
 

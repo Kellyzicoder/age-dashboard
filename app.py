@@ -2,8 +2,14 @@
 
 Explores how the age profile of 1,000 churches changes over time (2015–2026)
 using member-level records (join year, leave year, birth year).
+
+Pages live in the sidebar (st.navigation); filters are shared across pages.
+Light/dark follows the viewer's Streamlit theme (Settings → Theme, or system).
+The Live activity page refreshes itself every few seconds (st.fragment run_every).
 """
+from datetime import datetime
 from pathlib import Path
+from zoneinfo import ZoneInfo
 
 import numpy as np
 import pandas as pd
@@ -11,65 +17,85 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Age Dashboard", page_icon="⛪", layout="wide")
+st.set_page_config(page_title="Age Dashboard", page_icon="⛪", layout="wide", initial_sidebar_state="expanded")
 
 DATA = Path(__file__).parent / "data"
+TZ = ZoneInfo("Pacific/Auckland")
+
+
+# ---------- theme tokens (validated reference palette, light + dark steps) ----------
+def is_dark() -> bool:
+    try:
+        return st.context.theme.type == "dark"
+    except Exception:
+        return False
+
+
+DARK = is_dark()
+if DARK:
+    T = dict(surface="#1a1a19", card="#232322", sidebar="#141413", ink="#ffffff", ink2="#c3c2b7", muted="#898781",
+             grid="#2c2c2a", mid="#383835",
+             series=["#3987e5", "#d95926", "#199e70", "#c98500", "#d55181", "#008300", "#9085e9", "#e66767"],
+             bands=["#cde2fb", "#9ec5f4", "#6da7ec", "#3987e5", "#2a78d6", "#1c5cab", "#184f95"])
+else:
+    T = dict(surface="#fcfcfb", card="#ffffff", sidebar="#f3f2ee", ink="#0b0b0b", ink2="#52514e", muted="#898781",
+             grid="#e1e0d9", mid="#f0efec",
+             series=["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"],
+             bands=["#86b6ef", "#6da7ec", "#5598e7", "#2a78d6", "#256abf", "#184f95", "#0d366b"])
+
+SERIES = T["series"]
+# Age bands are ordered -> one sequential hue, light (young) to dark (old)
+BANDS = ["0–12", "13–17", "18–24", "25–34", "35–49", "50–64", "65+"]
+BAND_EDGES = [-1, 12, 17, 24, 34, 49, 64, 200]
+BAND_MAP = dict(zip(BANDS, T["bands"]))
+YOUTH_BANDS = BANDS[:3]  # under 25
 
 # ---------- look & feel ----------
-st.html("""
+st.html(f"""
 <style>
 @import url('https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&display=swap');
-html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSidebar"] {font-family: 'Inter', system-ui, sans-serif;}
-.block-container {padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px;}
-[data-testid="stMetric"] {background: #ffffff; box-shadow: 0 1px 2px rgba(11,11,11,.04);}
-[data-testid="stMetricLabel"] p {font-size: .82rem; color: #52514e; font-weight: 500;}
-[data-testid="stMetricValue"] {font-weight: 700; letter-spacing: -.02em;}
-[data-testid="stVerticalBlockBorderWrapper"] {background: #ffffff;}
-.stTabs [data-baseweb="tab-list"] {gap: .25rem;}
-.stTabs [data-baseweb="tab"] {padding: .5rem 1rem; border-radius: .6rem .6rem 0 0; font-weight: 500;}
-[data-testid="stSidebar"] {background: #f3f2ee;}
-.hero {background: linear-gradient(120deg, #0d366b 0%, #1c5cab 55%, #2a78d6 100%); color: #fff;
-       border-radius: 1rem; padding: 1.6rem 1.8rem; margin-bottom: .4rem;}
-.hero h1 {font-size: 2rem; font-weight: 800; margin: 0; letter-spacing: -.02em; color: #fff;}
-.hero p {margin: .35rem 0 .9rem; opacity: .88; font-size: .98rem;}
-.chip {display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28);
-       border-radius: 999px; padding: .2rem .7rem; margin: 0 .35rem .35rem 0; font-size: .8rem; font-weight: 500;}
+html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSidebar"] {{font-family: 'Inter', system-ui, sans-serif;}}
+.block-container {{padding-top: 1.6rem; padding-bottom: 3rem; max-width: 1400px;}}
+[data-testid="stMetric"] {{background: {T["card"]}; box-shadow: 0 1px 2px rgba(0,0,0,.05);}}
+[data-testid="stMetricLabel"] p {{font-size: .82rem; color: {T["ink2"]}; font-weight: 500;}}
+[data-testid="stMetricValue"] {{font-weight: 700; letter-spacing: -.02em;}}
+[data-testid="stSidebar"] {{background: {T["sidebar"]};}}
+.hero {{background: linear-gradient(120deg, #0d366b 0%, #1c5cab 55%, #2a78d6 100%); color: #fff;
+        border-radius: 1rem; padding: 1.4rem 1.8rem; margin-bottom: .4rem;}}
+.hero .eyebrow {{font-size: .78rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; opacity: .75;}}
+.hero h1 {{font-size: 1.9rem; font-weight: 800; margin: .1rem 0 0; letter-spacing: -.02em; color: #fff; padding: 0;}}
+.hero p {{margin: .35rem 0 .9rem; opacity: .88; font-size: .98rem;}}
+.chip {{display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28);
+        border-radius: 999px; padding: .2rem .7rem; margin: 0 .35rem .35rem 0; font-size: .8rem; font-weight: 500;}}
+.live-dot {{display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; background: #0ca30c;
+            margin-right: .45rem; animation: pulse 1.6s infinite;}}
+@keyframes pulse {{0% {{box-shadow: 0 0 0 0 rgba(12,163,12,.6);}} 70% {{box-shadow: 0 0 0 .5rem rgba(12,163,12,0);}}
+                   100% {{box-shadow: 0 0 0 0 rgba(12,163,12,0);}}}}
 </style>
 """)
 
 PLOT_CFG = {"displayModeBar": False, "responsive": True}
+LAYOUT = dict(
+    font=dict(family="Inter, system-ui, sans-serif", size=13, color=T["ink2"]),
+    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+    margin=dict(l=10, r=10, t=50, b=10), hovermode="x unified",
+    hoverlabel=dict(bgcolor=T["card"], bordercolor=T["grid"], font=dict(color=T["ink"])),
+    legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, title=None, font=dict(color=T["ink2"])),
+)
+
+
+def style(fig, height=380, title=None):
+    fig.update_layout(**LAYOUT, height=height,
+                      title=dict(text=title, font=dict(size=15, color=T["ink"])) if title else None)
+    fig.update_xaxes(gridcolor=T["grid"], linecolor=T["grid"], zeroline=False, title_font_color=T["muted"])
+    fig.update_yaxes(gridcolor=T["grid"], linecolor=T["grid"], zeroline=False, title_font_color=T["muted"])
+    return fig
 
 
 def card(where, fig):
     """Render a Plotly figure inside a bordered card."""
     with where.container(border=True):
         st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
-
-# ---------- palette (validated reference palette; see README) ----------
-INK, INK2, MUTED, GRID = "#0b0b0b", "#52514e", "#898781", "#e1e0d9"
-SERIES = ["#2a78d6", "#eb6834", "#1baf7a", "#eda100", "#e87ba4", "#008300", "#4a3aa7", "#e34948"]
-# Age bands are ordered -> one sequential hue, light (young) to dark (old)
-BANDS = ["0–12", "13–17", "18–24", "25–34", "35–49", "50–64", "65+"]
-BAND_EDGES = [-1, 12, 17, 24, 34, 49, 64, 200]
-BAND_COLORS = ["#86b6ef", "#6da7ec", "#5598e7", "#2a78d6", "#256abf", "#184f95", "#0d366b"]
-BAND_MAP = dict(zip(BANDS, BAND_COLORS))
-YOUTH_BANDS = BANDS[:3]  # under 25
-
-LAYOUT = dict(
-    font=dict(family="Inter, system-ui, sans-serif", size=13, color=INK2),
-    paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
-    margin=dict(l=10, r=10, t=50, b=10), hovermode="x unified",
-    legend=dict(orientation="h", yanchor="top", y=-0.15, x=0, title=None),
-    xaxis=dict(gridcolor=GRID, linecolor=GRID, tickcolor=GRID, zeroline=False),
-    yaxis=dict(gridcolor=GRID, linecolor=GRID, zeroline=False),
-)
-
-
-def style(fig, height=380, title=None):
-    fig.update_layout(**LAYOUT, height=height, title=dict(text=title, font=dict(size=15, color=INK)) if title else None)
-    fig.update_xaxes(gridcolor=GRID, title_font_color=MUTED)
-    fig.update_yaxes(gridcolor=GRID, title_font_color=MUTED)
-    return fig
 
 
 # ---------- data ----------
@@ -118,64 +144,70 @@ def median_by(df, keys):
     return agg.groupby(keys).apply(lambda g: weighted_median(g.age, g.n), include_groups=False).rename("median_age").reset_index()
 
 
+def band_of(age: int) -> str:
+    return BANDS[int(np.searchsorted(BAND_EDGES, age, side="left")) - 1]
+
+
 churches, members = load()
 snap = snapshots(members)
 snap = snap.merge(churches[["church_id", "region", "denomination", "setting"]], on="church_id")
-
 YEARS = sorted(snap.year.unique())
 
-# ---------- sidebar filters ----------
-st.sidebar.title("⛪ Filters")
-yr = st.sidebar.slider("Year range", int(YEARS[0]), int(YEARS[-1]), (int(YEARS[0]), int(YEARS[-1])))
-regions = st.sidebar.multiselect("Region", sorted(churches.region.unique()))
-denoms = st.sidebar.multiselect("Denomination", sorted(churches.denomination.unique()))
-settings = st.sidebar.multiselect("Setting", sorted(churches.setting.unique()))
-gender = st.sidebar.radio("Gender", ["All", "F", "M"], horizontal=True)
-st.sidebar.caption(f"Dataset: {len(churches):,} churches · {len(members):,} member records")
+# ---------- shared sidebar filters ----------
+with st.sidebar:
+    st.header("Filters")
+    yr = st.slider("Year range", int(YEARS[0]), int(YEARS[-1]), (int(YEARS[0]), int(YEARS[-1])), key="yr")
+    regions = st.multiselect("Region", sorted(churches.region.unique()), key="regions")
+    denoms = st.multiselect("Denomination", sorted(churches.denomination.unique()), key="denoms")
+    settings = st.multiselect("Setting", sorted(churches.setting.unique()), key="settings")
+    gender = st.radio("Gender", ["All", "F", "M"], horizontal=True, key="gender")
+    st.caption(f"Dataset: {len(churches):,} churches · {len(members):,} member records")
 
-mask = snap.year.between(*yr)
-if regions: mask &= snap.region.isin(regions)
-if denoms: mask &= snap.denomination.isin(denoms)
-if settings: mask &= snap.setting.isin(settings)
-if gender != "All": mask &= snap.gender == gender
+geo = snap.year.between(*yr)  # filters except gender (the pyramid splits by gender itself)
+if regions: geo &= snap.region.isin(regions)
+if denoms: geo &= snap.denomination.isin(denoms)
+if settings: geo &= snap.setting.isin(settings)
+mask = geo & (snap.gender == gender) if gender != "All" else geo
 f = snap[mask]
 if f.empty:
-    st.warning("No data for these filters."); st.stop()
+    st.warning("No data for these filters.")
+    st.stop()
 first, last = int(f.year.min()), int(f.year.max())
-
-# ---------- header + KPIs ----------
-chips = [f"{first}–{last}", ", ".join(regions) or "All regions", ", ".join(denoms) or "All denominations",
-         ", ".join(settings) or "Urban, peri-urban & rural", {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
-st.html(
-    '<div class="hero"><h1>⛪ Age Dashboard</h1>'
-    f'<p>How congregations are growing — and ageing — across {f.church_id.nunique():,} churches</p>'
-    + "".join(f'<span class="chip">{c}</span>' for c in chips) + "</div>")
 
 tot = f.groupby("year").n.sum()
 med = median_by(f, ["year"]).set_index("year").median_age
 youth = f[f.band.isin(YOUTH_BANDS)].groupby("year").n.sum() / tot
 old = f[f.band == "65+"].groupby("year").n.sum() / tot
-prev = last - 1 if last - 1 in tot.index else last
 
-growth_idx = (tot / tot[first] - 1) * 100
-spark = dict(border=True, chart_type="line")
-k = st.columns(5)
-k[0].metric(f"Members ({last})", f"{tot[last]:,}", f"{(tot[last]/tot[prev]-1):+.1%} vs {prev}" if prev != last else None,
-            chart_data=tot.tolist(), **spark)
-k[1].metric(f"Growth since {first}", f"{(tot[last]/tot[first]-1):+.1%}", f"{tot[last]-tot[first]:+,} members",
-            delta_color="off", chart_data=growth_idx.round(1).tolist(), **spark)
-k[2].metric("Median age", f"{med[last]:.0f} yrs", f"{med[last]-med[first]:+.0f} since {first}", delta_color="inverse",
-            chart_data=med.tolist(), **spark)
-k[3].metric("Under 25 share", f"{youth[last]:.1%}", f"{(youth[last]-youth[first])*100:+.1f} pts",
-            chart_data=(youth * 100).round(1).tolist(), **spark)
-k[4].metric("65+ share", f"{old[last]:.1%}", f"{(old[last]-old[first])*100:+.1f} pts", delta_color="inverse",
-            chart_data=(old * 100).round(1).tolist(), **spark)
-st.write("")
 
-tabs = st.tabs(["📈 Overview", "🧭 Compare groups", "👥 Age pyramid", "🏛️ Churches", "🔎 Church profile"])
+def hero(page_title: str, subtitle: str, live: bool = False):
+    chips = [f"{first}–{last}", ", ".join(regions) or "All regions", ", ".join(denoms) or "All denominations",
+             ", ".join(settings) or "Urban, peri-urban & rural", {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
+    dot = '<span class="live-dot"></span>' if live else ""
+    st.html(
+        f'<div class="hero"><div class="eyebrow">⛪ Age Dashboard</div><h1>{dot}{page_title}</h1><p>{subtitle}</p>'
+        + "".join(f'<span class="chip">{c}</span>' for c in chips) + "</div>")
 
-# ---------- Overview ----------
-with tabs[0]:
+
+# ---------- pages ----------
+def page_overview():
+    hero("Overview", f"How congregations are growing — and ageing — across {f.church_id.nunique():,} churches")
+    prev = last - 1 if last - 1 in tot.index else last
+    growth_idx = (tot / tot[first] - 1) * 100
+    spark = dict(border=True, chart_type="line")
+    k = st.columns(5)
+    k[0].metric(f"Members ({last})", f"{tot[last]:,}", f"{(tot[last]/tot[prev]-1):+.1%} vs {prev}" if prev != last else None,
+                chart_data=tot.tolist(), **spark)
+    k[1].metric(f"Growth since {first}", f"{(tot[last]/tot[first]-1):+.1%}", f"{tot[last]-tot[first]:+,} members",
+                delta_color="off", chart_data=growth_idx.round(1).tolist(), **spark)
+    k[2].metric("Median age", f"{med[last]:.0f} yrs", f"{med[last]-med[first]:+.0f} since {first}", delta_color="inverse",
+                chart_data=med.tolist(), **spark)
+    k[3].metric("Under 25 share", f"{youth[last]:.1%}", f"{(youth[last]-youth[first])*100:+.1f} pts",
+                chart_data=(youth * 100).round(1).tolist(), **spark)
+    k[4].metric("65+ share", f"{old[last]:.1%}", f"{(old[last]-old[first])*100:+.1f} pts", delta_color="inverse",
+                chart_data=(old * 100).round(1).tolist(), **spark)
+    st.write("")
+
     by_band = f.groupby(["year", "band"], observed=True).n.sum().reset_index()
     c1, c2 = st.columns([3, 2])
     fig = px.area(by_band, x="year", y="n", color="band", category_orders={"band": BANDS},
@@ -186,32 +218,119 @@ with tabs[0]:
     share = by_band.assign(pct=by_band.n / by_band.groupby("year").n.transform("sum") * 100)
     fig = px.bar(share, x="year", y="pct", color="band", category_orders={"band": BANDS},
                  color_discrete_map=BAND_MAP, labels={"pct": "% of members", "year": "", "band": "Age"})
-    fig.update_traces(marker_line_width=0.5, marker_line_color="#fcfcfb", hovertemplate="%{y:.1f}%")
+    fig.update_traces(marker_line_width=0.5, marker_line_color=T["surface"], hovertemplate="%{y:.1f}%")
     fig.update_layout(bargap=0.15)
     card(c2, style(fig, title="Age mix (share of members)"))
 
-    # growth by band: indexed to first year
     piv = by_band.pivot(index="year", columns="band", values="n")
     growth = (piv.iloc[-1] / piv.iloc[0] - 1).reindex(BANDS) * 100
     c3, c4 = st.columns([2, 3])
-    fig = go.Figure(go.Bar(x=growth.values, y=BANDS, orientation="h",
-                           marker_color=[BAND_MAP[b] for b in BANDS],
+    fig = go.Figure(go.Bar(x=growth.values, y=BANDS, orientation="h", marker_color=[BAND_MAP[b] for b in BANDS],
                            text=[f"{v:+.0f}%" for v in growth.values], textposition="outside", cliponaxis=False,
-                           hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
+                           textfont=dict(color=T["ink2"]), hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
     fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"),
                       xaxis=dict(range=[min(0, growth.min() * 1.25), growth.max() * 1.2]))
     card(c3, style(fig, title=f"Growth by age group, {first}→{last}"))
 
-    mdf = med.reset_index()
-    fig = px.line(mdf, x="year", y="median_age", markers=True, labels={"median_age": "Median age", "year": ""})
+    fig = px.line(med.reset_index(), x="year", y="median_age", markers=True, labels={"median_age": "Median age", "year": ""})
     fig.update_traces(line=dict(width=2, color=SERIES[0]), marker=dict(size=8))
     card(c4, style(fig, title="Median member age"))
 
-# ---------- Compare groups ----------
-with tabs[1]:
+
+def page_live():
+    hero("Live activity", "Members joining and leaving right now — updates automatically", live=True)
+    c_on, c_speed, c_reset = st.columns([1, 2, 1], vertical_alignment="center")
+    on = c_on.toggle("Live updates", value=True)
+    every = c_speed.select_slider("Refresh every", options=[2, 3, 5, 10, 30], value=3, format_func=lambda s: f"{s}s")
+    if c_reset.button("Reset feed", icon=":material/restart_alt:"):
+        st.session_state.pop("live", None)
+
+    # Simulation source: sample new events from the current (filtered) membership.
+    # To go live for real, replace `next_events()` with a query against your members database.
+    base_now = f[f.year == last]
+    ch_w = base_now.groupby("church_id").n.sum()
+    age_w = base_now.groupby("age").n.sum()
+    cmeta = churches.set_index("church_id")
+
+    if "live" not in st.session_state:
+        st.session_state.live = dict(rng=np.random.default_rng(), members=int(tot[last]), events=[],
+                                     history=[(datetime.now(TZ), int(tot[last]))], joined=0, left=0)
+
+    def next_events(S):
+        rng = S["rng"]
+        n_join, n_leave = rng.poisson(max(1.0, len(ch_w) / 200)), rng.poisson(max(0.6, len(ch_w) / 330))
+        now = datetime.now(TZ)
+        evs = []
+        for kind, n in (("Joined", n_join), ("Left", n_leave)):
+            if n == 0:
+                continue
+            cids = rng.choice(ch_w.index, size=n, p=(ch_w / ch_w.sum()).values)
+            if kind == "Joined":  # joiners skew young: children + young adults
+                ages = np.where(rng.random(n) < 0.25, rng.integers(0, 3, n), np.clip(rng.normal(29, 10, n), 13, 85)).astype(int)
+            else:
+                ages = rng.choice(age_w.index, size=n, p=(age_w / age_w.sum()).values)
+            for cid, a in zip(cids, ages):
+                evs.append(dict(time=now, event=kind, church=cmeta.at[cid, "church_name"], region=cmeta.at[cid, "region"],
+                                age=int(a), age_group=band_of(int(a))))
+        return evs, n_join, n_leave
+
+    def live_body():
+        S = st.session_state.live
+        if on:
+            evs, nj, nl = next_events(S)
+            S["events"] = (evs + S["events"])[:300]
+            S["joined"] += nj; S["left"] += nl
+            S["members"] += nj - nl
+            S["history"] = (S["history"] + [(datetime.now(TZ), S["members"])])[-120:]
+        ev = pd.DataFrame(S["events"])
+        hist = pd.DataFrame(S["history"], columns=["time", "members"])
+
+        k = st.columns(4)
+        k[0].metric("Members right now", f"{S['members']:,}", f"{S['members'] - int(tot[last]):+,} this session", border=True)
+        k[1].metric("Joined", f"{S['joined']:,}", border=True)
+        k[2].metric("Left", f"{S['left']:,}", border=True)
+        med_join = f"{ev[ev.event == 'Joined'].age.median():.0f} yrs" if len(ev) and (ev.event == "Joined").any() else "–"
+        k[3].metric("Median age of joiners", med_join, border=True)
+
+        c1, c2 = st.columns([3, 2])
+        fig = px.line(hist, x="time", y="members", labels={"members": "Members", "time": ""})
+        fig.update_traces(line=dict(width=2, color=SERIES[0]), mode="lines+markers", marker=dict(size=5))
+        fig.update_layout(hovermode="x unified", showlegend=False)
+        card(c1, style(fig, 340, "Membership — live"))
+
+        if len(ev):
+            by = ev.groupby(["age_group", "event"]).size().rename("n").reset_index()
+            by["n"] = np.where(by.event == "Left", -by.n, by.n)
+            fig = px.bar(by, x="n", y="age_group", color="event", orientation="h", barmode="relative",
+                         category_orders={"age_group": BANDS, "event": ["Joined", "Left"]},
+                         color_discrete_map={"Joined": SERIES[2], "Left": SERIES[1]},
+                         labels={"n": "Members (left ← → joined)", "age_group": "", "event": ""})
+            fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"))
+            fig.update_traces(hovertemplate="%{y}: %{customdata}<extra>%{fullData.name}</extra>", customdata=None)
+            for tr in fig.data:
+                tr.customdata = np.abs(tr.x)
+            card(c2, style(fig, 340, "This session by age group"))
+        else:
+            with c2.container(border=True):
+                st.info("Waiting for the first events…", icon=":material/hourglass_top:")
+
+        with st.container(border=True):
+            st.markdown("**Latest activity**")
+            if len(ev):
+                show = ev.head(15).assign(time=lambda d: d.time.dt.strftime("%H:%M:%S"))
+                st.dataframe(show, hide_index=True, width="stretch",
+                             column_config={"event": st.column_config.TextColumn("Event"),
+                                            "age_group": st.column_config.TextColumn("Age group")})
+            st.caption(f"Last updated {datetime.now(TZ):%H:%M:%S} NZT · "
+                       + (f"refreshing every {every}s" if on else "paused"))
+
+    st.fragment(live_body, run_every=every if on else None)()
+
+
+def page_compare():
+    hero("Compare groups", "Median age and membership growth side by side")
     dim = st.segmented_control("Compare by", ["region", "denomination", "setting"], default="denomination",
                                format_func=str.title) or "denomination"
-    groups = sorted(f[dim].unique())
     cmap = {g: SERIES[i % len(SERIES)] for i, g in enumerate(sorted(churches[dim].unique()))}
     c1, c2 = st.columns(2)
     md = median_by(f, ["year", dim])
@@ -226,27 +345,24 @@ with tabs[1]:
     fig = px.line(t, x="year", y="index", color=dim, color_discrete_map=cmap, markers=True,
                   labels={"index": f"Members (index, {first}=100)", "year": "", dim: ""})
     fig.update_traces(line_width=2, marker_size=7)
-    fig.add_hline(y=100, line_color=MUTED, line_width=1, line_dash="dot")
+    fig.add_hline(y=100, line_color=T["muted"], line_width=1, line_dash="dot")
     card(c2, style(fig, 420, "Membership growth (indexed)"))
 
-    # heatmap: growth % by group × age band (diverging blue<->red, grey midpoint)
+    # heatmap: growth % by group × age band (diverging red <-> blue, neutral midpoint)
     hb = f[f.year.isin([first, last])].groupby([dim, "band", "year"], observed=True).n.sum().unstack("year")
     hb = ((hb[last] / hb[first] - 1) * 100).unstack("band").reindex(columns=BANDS)
     lim = float(np.nanpercentile(np.abs(hb.values), 95)) or 1
     fig = px.imshow(hb, text_auto=".0f", aspect="auto", zmin=-lim, zmax=lim,
-                    color_continuous_scale=[[0, "#d03b3b"], [0.5, "#f0efec"], [1, "#1c5cab"]],
+                    color_continuous_scale=[[0, "#d03b3b"], [0.5, T["mid"]], [1, "#3987e5" if DARK else "#1c5cab"]],
                     labels=dict(color="Growth %", x="Age group", y=""))
     fig.update_layout(hovermode="closest")
     card(st, style(fig, 360, f"Growth % by age group, {first}→{last}"))
 
-# ---------- Age pyramid ----------
-with tabs[2]:
+
+def page_pyramid():
+    hero("Age pyramid", "Male and female members by 5-year age group")
     py = st.select_slider("Year", options=list(range(first, last + 1)), value=last)
-    pm = snap.year.between(*yr)
-    if regions: pm &= snap.region.isin(regions)
-    if denoms: pm &= snap.denomination.isin(denoms)
-    if settings: pm &= snap.setting.isin(settings)
-    p = snap[pm].copy()
+    p = snap[geo].copy()
     p["age5"] = (p.age // 5 * 5).clip(upper=85)
     lab = lambda a: "85+" if a == 85 else f"{a}–{a+4}"
     cur = p[p.year == py].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
@@ -259,17 +375,18 @@ with tabs[2]:
                 hovertemplate="%{y}: %{x:,}<extra>Female</extra>")
     if py != first:
         fig.add_scatter(y=[lab(a) for a in ref.index], x=-ref.get("M", 0), mode="lines", name=f"{first} outline",
-                        line=dict(color=INK, width=1.5, shape="hvh"), hoverinfo="skip")
+                        line=dict(color=T["ink"], width=1.5, shape="hvh"), hoverinfo="skip")
         fig.add_scatter(y=[lab(a) for a in ref.index], x=ref.get("F", 0), mode="lines", showlegend=False,
-                        line=dict(color=INK, width=1.5, shape="hvh"), hoverinfo="skip")
+                        line=dict(color=T["ink"], width=1.5, shape="hvh"), hoverinfo="skip")
     mx = max(cur.max().max(), ref.max().max()) * 1.1
+    ticks = np.linspace(-mx, mx, 7).round(-3)
     fig.update_layout(barmode="overlay", bargap=0.1, hovermode="closest",
-                      xaxis=dict(range=[-mx, mx], tickformat=",", title="Members"))
-    fig.update_xaxes(tickvals=np.linspace(-mx, mx, 7).round(-3), ticktext=[f"{abs(v):,.0f}" for v in np.linspace(-mx, mx, 7).round(-3)])
-    card(st, style(fig, 560, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")))
+                      xaxis=dict(range=[-mx, mx], title="Members", tickvals=ticks, ticktext=[f"{abs(v):,.0f}" for v in ticks]))
+    card(st, style(fig, 600, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")))
 
-# ---------- Churches ----------
-with tabs[3]:
+
+def page_churches():
+    hero("Churches", "Every church's age profile and growth — search, sort and download")
     cs = f[f.year.isin([first, last])].groupby(["church_id", "year"]).n.sum().unstack(fill_value=0)
     cm = median_by(f[f.year == last], ["church_id"]).set_index("church_id").median_age
     cm0 = median_by(f[f.year == first], ["church_id"]).set_index("church_id").median_age
@@ -284,14 +401,14 @@ with tabs[3]:
     c1, c2 = st.columns([3, 2])
     fig = px.scatter(tbl, x="median_age", y="growth_pct", size=f"members_{last}", color="denomination",
                      color_discrete_map={g: SERIES[i % 8] for i, g in enumerate(sorted(churches.denomination.unique()))},
-                     hover_name="church_name", size_max=22, opacity=0.75,
+                     hover_name="church_name", size_max=22, opacity=0.8,
                      labels={"median_age": f"Median age ({last})", "growth_pct": f"Growth % {first}→{last}", "denomination": ""})
-    fig.update_traces(marker=dict(line=dict(width=1, color="#fcfcfb")))
-    fig.add_hline(y=0, line_color=MUTED, line_width=1, line_dash="dot")
+    fig.update_traces(marker=dict(line=dict(width=1, color=T["surface"])))
+    fig.add_hline(y=0, line_color=T["muted"], line_width=1, line_dash="dot")
     fig.update_layout(hovermode="closest")
-    card(c1, style(fig, 460, "Every church: age vs growth"))
+    card(c1, style(fig, 480, "Every church: age vs growth"))
 
-    with c2:
+    with c2.container(border=True):
         st.markdown("**Fastest growing**")
         st.dataframe(tbl.nlargest(8, "growth_pct")[["church_name", "region", "growth_pct"]],
                      hide_index=True, width="stretch",
@@ -301,40 +418,64 @@ with tabs[3]:
                      hide_index=True, width="stretch",
                      column_config={"median_age_change": st.column_config.NumberColumn("Δ median age", format="%+.0f yrs")})
 
-    q = st.text_input("Search churches", placeholder="Name, region or denomination…")
-    show = tbl if not q else tbl[tbl.apply(lambda r: q.lower() in f"{r.church_name} {r.region} {r.denomination}".lower(), axis=1)]
-    st.dataframe(show.sort_values("growth_pct", ascending=False), hide_index=True, width="stretch", height=420,
-                 column_config={
-                     "growth_pct": st.column_config.NumberColumn("Growth %", format="%+.1f%%"),
-                     "youth_share": st.column_config.ProgressColumn("Under 25", format="percent", min_value=0, max_value=1),
-                     "median_age": st.column_config.NumberColumn("Median age", format="%.0f"),
-                     "median_age_change": st.column_config.NumberColumn("Δ median age", format="%+.0f"),
-                 })
-    st.download_button("⬇️ Download table (CSV)", show.to_csv(index=False), "church_age_summary.csv", "text/csv")
+    with st.container(border=True):
+        q = st.text_input("Search churches", placeholder="Name, region or denomination…")
+        show = tbl if not q else tbl[tbl.apply(lambda r: q.lower() in f"{r.church_name} {r.region} {r.denomination}".lower(), axis=1)]
+        st.dataframe(show.sort_values("growth_pct", ascending=False), hide_index=True, width="stretch", height=420,
+                     column_config={
+                         "growth_pct": st.column_config.NumberColumn("Growth %", format="%+.1f%%"),
+                         "youth_share": st.column_config.ProgressColumn("Under 25", format="percent", min_value=0, max_value=1),
+                         "median_age": st.column_config.NumberColumn("Median age", format="%.0f"),
+                         "median_age_change": st.column_config.NumberColumn("Δ median age", format="%+.0f"),
+                     })
+        st.download_button("Download table (CSV)", show.to_csv(index=False), "church_age_summary.csv", "text/csv",
+                           icon=":material/download:")
 
-# ---------- Church profile ----------
-with tabs[4]:
+
+def page_profile():
     opts = churches.set_index("church_id").church_name
     cid = st.selectbox("Choose a church", opts.index, format_func=lambda i: f"{opts[i]} ({i})")
     info = churches.set_index("church_id").loc[cid]
-    st.caption(f"{info.denomination} · {info.region} · {info.setting} · founded {info.founded}")
+    hero(opts[cid], f"{info.denomination} · {info.region} · {info.setting} · founded {info.founded}")
     one = snap[(snap.church_id == cid) & snap.year.between(*yr)]
     ob = one.groupby(["year", "band"], observed=True).n.sum().reset_index()
     c1, c2 = st.columns(2)
     fig = px.bar(ob, x="year", y="n", color="band", category_orders={"band": BANDS}, color_discrete_map=BAND_MAP,
                  labels={"n": "Members", "year": "", "band": "Age"})
-    fig.update_traces(marker_line_width=0.5, marker_line_color="#fcfcfb")
+    fig.update_traces(marker_line_width=0.5, marker_line_color=T["surface"])
     card(c1, style(fig, title="Members by age group"))
     om = median_by(one, ["year"])
     allm = med.reset_index().assign(who="All filtered churches")
     fig = px.line(pd.concat([om.assign(who=opts[cid]), allm]), x="year", y="median_age", color="who", markers=True,
-                  color_discrete_sequence=[SERIES[1], MUTED], labels={"median_age": "Median age", "year": "", "who": ""})
+                  color_discrete_sequence=[SERIES[1], T["muted"]], labels={"median_age": "Median age", "year": "", "who": ""})
     fig.update_traces(line_width=2, marker_size=7)
     card(c2, style(fig, title="Median age vs all churches"))
 
-with st.expander("About this data"):
+
+def page_about():
+    hero("About the data", "Where the numbers come from and how to use your own")
     st.markdown(
         "Synthetic but realistic data generated by `generate_data.py`: 1,000 churches across 7 regions and "
-        "7 denominations, with member-level join/leave years and birth years for 2015–2026. "
-        "Replace `data/churches.csv.gz` and `data/members.csv.gz` with your own records (same columns) "
-        "and the dashboard updates automatically.")
+        "7 denominations, with member-level join/leave years and birth years for 2015–2026.\n\n"
+        "**Live activity** simulates new members joining and leaving, sampled from the current membership. "
+        "To make it truly live, swap `next_events()` in `app.py` for a query against your members database "
+        "(e.g. `st.connection('sql')` or a Google Sheet).\n\n"
+        "To use real records, add `data/churches.csv.gz` and `data/members.csv.gz` (same columns) to the repo "
+        "and remove the `data/*.csv.gz` line from `.gitignore`.\n\n"
+        "**Theme:** open the ⋮ menu → *Settings* → *Theme* to switch between light, dark or your system setting.")
+
+
+pg = st.navigation({
+    "Dashboard": [
+        st.Page(page_overview, title="Overview", icon=":material/dashboard:", url_path="overview", default=True),
+        st.Page(page_live, title="Live activity", icon=":material/sensors:", url_path="live"),
+        st.Page(page_compare, title="Compare groups", icon=":material/compare_arrows:", url_path="compare"),
+        st.Page(page_pyramid, title="Age pyramid", icon=":material/groups:", url_path="pyramid"),
+    ],
+    "Churches": [
+        st.Page(page_churches, title="All churches", icon=":material/church:", url_path="churches"),
+        st.Page(page_profile, title="Church profile", icon=":material/search:", url_path="profile"),
+    ],
+    "Info": [st.Page(page_about, title="About the data", icon=":material/info:", url_path="about")],
+})
+pg.run()
