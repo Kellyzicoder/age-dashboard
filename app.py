@@ -83,59 +83,62 @@ def card(where, fig):
         st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
 
 
-# ---------- data ----------
-@st.cache_data(show_spinner="Loading member records…")
-def load():
-    if not (DATA / "members.csv.gz").exists():  # first run (e.g. Streamlit Cloud): build the dataset
-        import subprocess, sys
-        DATA.mkdir(exist_ok=True)
-        subprocess.run([sys.executable, "generate_data.py"], cwd=Path(__file__).parent, check=True)
-    churches = pd.read_csv(DATA / "churches.csv.gz")
-    members = pd.read_csv(DATA / "members.csv.gz", dtype={"leave_year": "Int64"})
-    return churches, members
+# ---------- data (built once per server, shared by every viewer) ----------
+# st.cache_resource hands back the same objects without copying, which matters for ~1.3M-row frames;
+# nothing below mutates the cached frames.
+@st.cache_resource(show_spinner="Preparing data (first load only)…")
+def get_data():
+    if (DATA / "members.csv.gz").exists():
+        churches = pd.read_csv(DATA / "churches.csv.gz")
+        members = pd.read_csv(DATA / "members.csv.gz", dtype={"leave_year": "Int64"})
+    else:  # no CSVs in the repo (e.g. Streamlit Cloud): generate in memory, skipping the slow gzip step
+        from generate_data import generate
+        churches, members = generate()
+    snap = build_snapshots(churches, members)
+    return churches, snap, len(members)
 
 
-@st.cache_data(show_spinner="Building yearly age snapshots…")
-def snapshots(members: pd.DataFrame) -> pd.DataFrame:
-    """Active members per church × year × single-year age × gender."""
-    y0, y1 = int(members.join_year.min()), int(members.join_year.max())
-    y0 = max(y0, 2015)
+def build_snapshots(churches: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
+    """Active members per church × gender × single-year age × year, via one bincount per year."""
+    y0, y1 = max(int(members.join_year.min()), 2015), int(members.join_year.max())
+    ids = churches.church_id.to_numpy()
+    cc = pd.Categorical(members.church_id, categories=ids).codes.astype(np.int64)
+    gg = (members.gender.to_numpy() == "M").astype(np.int64)
     leave = members.leave_year.fillna(9999).astype(int).to_numpy()
     join = members.join_year.to_numpy()
     birth = members.birth_year.to_numpy()
+    n_c, n_a = len(ids), 101
     out = []
     for y in range(y0, y1 + 1):
         act = (join <= y) & (leave > y)
-        age = np.clip(y - birth[act], 0, 100)
-        df = pd.DataFrame({"church_id": members.church_id.to_numpy()[act], "gender": members.gender.to_numpy()[act], "age": age})
-        g = df.groupby(["church_id", "gender", "age"], observed=True).size().rename("n").reset_index()
-        g["year"] = y
-        out.append(g)
+        key = (cc[act] * 2 + gg[act]) * n_a + np.clip(y - birth[act], 0, 100)
+        cnt = np.bincount(key, minlength=n_c * 2 * n_a)
+        nz = np.flatnonzero(cnt)
+        out.append(pd.DataFrame({"c": nz // (2 * n_a), "g": (nz // n_a) % 2, "age": nz % n_a, "n": cnt[nz], "year": y}))
     snap = pd.concat(out, ignore_index=True)
-    snap["band"] = pd.cut(snap.age, BAND_EDGES, labels=BANDS)
-    snap["age"] = snap.age.astype("int16"); snap["n"] = snap.n.astype("int32"); snap["year"] = snap.year.astype("int16")
+    meta = churches.set_index("church_id")
+    snap = pd.DataFrame({
+        "church_id": ids[snap.c], "gender": np.where(snap.g == 1, "M", "F"),
+        "age": snap.age.astype("int16"), "n": snap.n.astype("int32"), "year": snap.year.astype("int16"),
+        "band": pd.cut(snap.age, BAND_EDGES, labels=BANDS),
+        "region": meta.region.to_numpy()[snap.c], "denomination": meta.denomination.to_numpy()[snap.c],
+        "setting": meta.setting.to_numpy()[snap.c]})
     return snap
 
 
-def weighted_median(ages, weights):
-    order = np.argsort(ages)
-    a, w = np.asarray(ages)[order], np.asarray(weights)[order]
-    c = np.cumsum(w)
-    return float(a[np.searchsorted(c, c[-1] / 2)]) if len(c) and c[-1] > 0 else np.nan
-
-
 def median_by(df, keys):
-    agg = df.groupby(keys + ["age"], observed=True).n.sum().reset_index()
-    return agg.groupby(keys).apply(lambda g: weighted_median(g.age, g.n), include_groups=False).rename("median_age").reset_index()
+    """Weighted median age per group, fully vectorised (no per-group Python)."""
+    agg = df.groupby(keys + ["age"], observed=True, sort=True).n.sum().reset_index()
+    g = agg.groupby(keys, observed=True, sort=False).n
+    agg = agg[agg.n.groupby([agg[k] for k in keys], observed=True).cumsum() >= g.transform("sum") / 2]
+    return agg.groupby(keys, observed=True).age.first().rename("median_age").reset_index()
 
 
 def band_of(age: int) -> str:
     return BANDS[int(np.searchsorted(BAND_EDGES, age, side="left")) - 1]
 
 
-churches, members = load()
-snap = snapshots(members)
-snap = snap.merge(churches[["church_id", "region", "denomination", "setting"]], on="church_id")
+churches, snap, N_MEMBERS = get_data()
 YEARS = sorted(snap.year.unique())
 
 # ---------- shared sidebar filters ----------
@@ -146,23 +149,34 @@ with st.sidebar:
     denoms = st.multiselect("Denomination", sorted(churches.denomination.unique()), key="denoms")
     settings = st.multiselect("Setting", sorted(churches.setting.unique()), key="settings")
     gender = st.radio("Gender", ["All", "F", "M"], horizontal=True, key="gender")
-    st.caption(f"Dataset: {len(churches):,} churches · {len(members):,} member records")
+    st.caption(f"Dataset: {len(churches):,} churches · {N_MEMBERS:,} member records")
 
-geo = snap.year.between(*yr)  # filters except gender (the pyramid splits by gender itself)
-if regions: geo &= snap.region.isin(regions)
-if denoms: geo &= snap.denomination.isin(denoms)
-if settings: geo &= snap.setting.isin(settings)
-mask = geo & (snap.gender == gender) if gender != "All" else geo
-f = snap[mask]
-if f.empty:
+
+
+@st.cache_resource(max_entries=64, show_spinner=False)
+def filtered(yr, regions, denoms, settings, gender):
+    """Filter once per filter combination; later page switches and reruns reuse the result."""
+    geo = snap.year.between(*yr)  # all filters except gender (the pyramid splits by gender itself)
+    if regions: geo &= snap.region.isin(regions)
+    if denoms: geo &= snap.denomination.isin(denoms)
+    if settings: geo &= snap.setting.isin(settings)
+    snap_geo = snap[geo]
+    f = snap_geo[snap_geo.gender == gender] if gender != "All" else snap_geo
+    if f.empty:
+        return None
+    tot = f.groupby("year").n.sum()
+    return dict(snap_geo=snap_geo, f=f, tot=tot, med=median_by(f, ["year"]).set_index("year").median_age,
+                youth=f[f.band.isin(YOUTH_BANDS)].groupby("year").n.sum() / tot,
+                old=f[f.band == "65+"].groupby("year").n.sum() / tot)
+
+
+FILTER_KEY = (tuple(yr), tuple(regions), tuple(denoms), tuple(settings), gender)
+R = filtered(*FILTER_KEY)
+if R is None:
     st.warning("No data for these filters.")
     st.stop()
+f, snap_geo, tot, med, youth, old = R["f"], R["snap_geo"], R["tot"], R["med"], R["youth"], R["old"]
 first, last = int(f.year.min()), int(f.year.max())
-
-tot = f.groupby("year").n.sum()
-med = median_by(f, ["year"]).set_index("year").median_age
-youth = f[f.band.isin(YOUTH_BANDS)].groupby("year").n.sum() / tot
-old = f[f.band == "65+"].groupby("year").n.sum() / tot
 
 
 def hero(page_title: str, subtitle: str, live: bool = False):
@@ -347,7 +361,7 @@ def page_compare():
 def page_pyramid():
     hero("Age pyramid", "Male and female members by 5-year age group")
     py = st.select_slider("Year", options=list(range(first, last + 1)), value=last)
-    p = snap[geo].copy()
+    p = snap_geo[snap_geo.year.isin([py, first])].copy()
     p["age5"] = (p.age // 5 * 5).clip(upper=85)
     lab = lambda a: "85+" if a == 85 else f"{a}–{a+4}"
     cur = p[p.year == py].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
@@ -370,8 +384,10 @@ def page_pyramid():
     card(st, style(fig, 600, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")))
 
 
-def page_churches():
-    hero("Churches", "Every church's age profile and growth — search, sort and download")
+@st.cache_resource(max_entries=32, show_spinner=False)
+def church_table(*key):
+    f = filtered(*key)["f"]
+    first, last = int(f.year.min()), int(f.year.max())
     cs = f[f.year.isin([first, last])].groupby(["church_id", "year"]).n.sum().unstack(fill_value=0)
     cm = median_by(f[f.year == last], ["church_id"]).set_index("church_id").median_age
     cm0 = median_by(f[f.year == first], ["church_id"]).set_index("church_id").median_age
@@ -382,7 +398,12 @@ def page_churches():
         "youth_share": cy / cs.get(last)})).dropna(subset=[f"members_{last}"])
     tbl["growth_pct"] = (tbl[f"members_{last}"] / tbl[f"members_{first}"] - 1) * 100
     tbl = tbl.reset_index()
+    return tbl
 
+
+def page_churches():
+    hero("Churches", "Every church's age profile and growth — search, sort and download")
+    tbl = church_table(*FILTER_KEY)
     c1, c2 = st.columns([3, 2])
     fig = px.scatter(tbl, x="median_age", y="growth_pct", size=f"members_{last}", color="denomination",
                      color_discrete_map={g: SERIES[i % 8] for i, g in enumerate(sorted(churches.denomination.unique()))},
@@ -405,7 +426,8 @@ def page_churches():
 
     with st.container(border=True):
         q = st.text_input("Search churches", placeholder="Name, region or denomination…")
-        show = tbl if not q else tbl[tbl.apply(lambda r: q.lower() in f"{r.church_name} {r.region} {r.denomination}".lower(), axis=1)]
+        hay = (tbl.church_name + " " + tbl.region + " " + tbl.denomination).str.lower()
+        show = tbl[hay.str.contains(q.lower(), regex=False)] if q else tbl
         st.dataframe(show.sort_values("growth_pct", ascending=False), hide_index=True, width="stretch", height=420,
                      column_config={
                          "growth_pct": st.column_config.NumberColumn("Growth %", format="%+.1f%%"),
