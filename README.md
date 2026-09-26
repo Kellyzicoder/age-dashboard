@@ -1,4 +1,4 @@
-# ⛪ Church Age Growth Dashboard
+# ⛪ Age Dashboard
 
 Interactive Streamlit dashboard showing how membership and the **age profile** of
 **1,000 churches** changed from 2015 to 2026, built on **~512,000 member records**.

@@ -1,4 +1,4 @@
-"""Church Age Growth Dashboard — Streamlit app.
+"""Age Dashboard — Streamlit app.
 
 Explores how the age profile of 1,000 churches changes over time (2015–2026)
 using member-level records (join year, leave year, birth year).
@@ -11,7 +11,7 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Church Age Growth", page_icon="⛪", layout="wide")
+st.set_page_config(page_title="Age Dashboard", page_icon="⛪", layout="wide")
 
 DATA = Path(__file__).parent / "data"
 
@@ -114,7 +114,7 @@ if f.empty:
 first, last = int(f.year.min()), int(f.year.max())
 
 # ---------- header + KPIs ----------
-st.title("Church Age Growth Dashboard")
+st.title("Age Dashboard")
 st.caption(f"How congregations are growing — and ageing — across {f.church_id.nunique():,} churches, {first}–{last}")
 
 tot = f.groupby("year").n.sum()
