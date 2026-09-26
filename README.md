@@ -21,7 +21,7 @@ Pages (sidebar navigation, filters shared across all pages):
 
 Filters (sidebar): year range, region, denomination, urban/rural setting, gender.
 
-Light and dark mode follow your system, or switch via ⋮ → Settings → Theme.
+Light and dark mode follow your device setting automatically.
 
 ## Run locally
 

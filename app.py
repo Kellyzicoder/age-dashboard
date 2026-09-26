@@ -4,7 +4,7 @@ Explores how the age profile of 1,000 churches changes over time (2015–2026)
 using member-level records (join year, leave year, birth year).
 
 Pages live in the sidebar (st.navigation); filters are shared across pages.
-Light/dark follows the viewer's Streamlit theme (Settings → Theme, or system).
+Light/dark follows the viewer's device setting.
 The Live activity page refreshes itself every few seconds (st.fragment run_every).
 """
 from datetime import datetime
@@ -181,9 +181,16 @@ f, snap_geo, tot, med, youth, old = R["f"], R["snap_geo"], R["tot"], R["med"], R
 first, last = int(f.year.min()), int(f.year.max())
 
 
+def chip_label(selected, options, none_label):
+    return none_label if not selected or len(selected) == len(options) else ", ".join(selected)
+
+
 def hero(page_title: str, subtitle: str, live: bool = False):
-    chips = [f"{first}–{last}", ", ".join(regions) or "All regions", ", ".join(denoms) or "All denominations",
-             ", ".join(settings) or "Urban, peri-urban & rural", {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
+    chips = [str(first) if first == last else f"{first}–{last}",
+             chip_label(regions, churches.region.unique(), "All regions"),
+             chip_label(denoms, churches.denomination.unique(), "All denominations"),
+             chip_label(settings, churches.setting.unique(), "Urban, peri-urban & rural"),
+             {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
     dot = '<span class="live-dot"></span>' if live else ""
     st.html(
         f'<div class="hero"><div class="eyebrow">⛪ Age Dashboard</div><h1>{dot}{page_title}</h1><p>{subtitle}</p>'
@@ -380,9 +387,12 @@ def page_pyramid():
         fig.add_scatter(y=[lab(a) for a in ref.index], x=ref.get("F", 0), mode="lines", showlegend=False,
                         line=dict(color=T["muted"], width=2, shape="hvh"), hoverinfo="skip")
     mx = max(cur.max().max(), ref.max().max()) * 1.1
-    ticks = np.linspace(-mx, mx, 7).round(-3)
+    raw = mx / 3  # "nice" tick step: 1, 2 or 5 × 10^k, so both sides get even, readable labels
+    mag = 10 ** np.floor(np.log10(raw))
+    step = mag * min((m for m in (1, 2, 5, 10) if m * mag >= raw))
+    ticks = np.arange(-np.ceil(mx / step), np.ceil(mx / step) + 1) * step
     fig.update_layout(barmode="overlay", bargap=0.1, hovermode="closest",
-                      xaxis=dict(range=[-mx, mx], title="Members", tickvals=ticks, ticktext=[f"{abs(v):,.0f}" for v in ticks]))
+                      xaxis=dict(range=[ticks[0], ticks[-1]], title="Members", tickvals=ticks, ticktext=[f"{abs(v):,.0f}" for v in ticks]))
     card(st, style(fig, 600, f"Age pyramid {py}" + (f" vs {first}" if py != first else "")))
 
 
@@ -471,7 +481,7 @@ def page_about():
         "(e.g. `st.connection('sql')` or a Google Sheet).\n\n"
         "To use real records, add `data/churches.csv.gz` and `data/members.csv.gz` (same columns) to the repo "
         "and remove the `data/*.csv.gz` line from `.gitignore`.\n\n"
-        "**Theme:** open the ⋮ menu → *Settings* → *Theme* to switch between light, dark or your system setting.")
+        "**Theme:** the dashboard follows your device's light or dark mode automatically.")
 
 
 pg = st.navigation({
