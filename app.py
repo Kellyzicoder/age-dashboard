@@ -196,9 +196,10 @@ with tabs[0]:
     c3, c4 = st.columns([2, 3])
     fig = go.Figure(go.Bar(x=growth.values, y=BANDS, orientation="h",
                            marker_color=[BAND_MAP[b] for b in BANDS],
-                           text=[f"{v:+.0f}%" for v in growth.values], textposition="outside",
+                           text=[f"{v:+.0f}%" for v in growth.values], textposition="outside", cliponaxis=False,
                            hovertemplate="%{y}: %{x:+.1f}%<extra></extra>"))
-    fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"))
+    fig.update_layout(hovermode="closest", yaxis=dict(autorange="reversed"),
+                      xaxis=dict(range=[min(0, growth.min() * 1.25), growth.max() * 1.2]))
     card(c3, style(fig, title=f"Growth by age group, {first}→{last}"))
 
     mdf = med.reset_index()
