@@ -202,6 +202,22 @@ class SqlStore:
         self._cache.pop("members", None)
         return len(rows)
 
+    def update_members(self, changes: dict[str, dict]) -> int:
+        """Set exact values (blanks allowed) for edited members — used by the editable register."""
+        n = 0
+        for mid, fields in changes.items():
+            fields = dict(fields)
+            if "group" in fields:
+                fields["group_name"] = fields.pop("group")
+            cols = [c for c in fields if c in MEMBER_COLS and c != "created_at"]
+            if not cols:
+                continue
+            vals = [None if (fields[c] in ("", None) and c in ("date_joined", "first_visit")) else fields[c] for c in cols]
+            self._exec(f"UPDATE members SET {', '.join(f'{c} = ?' for c in cols)} WHERE id = ?", vals + [mid])
+            n += 1
+        self._cache.pop("members", None)
+        return n
+
     # -- read-only SQL for the query page
     def run_query(self, sql: str, limit: int = 5000) -> pd.DataFrame:
         sql = sql.strip().rstrip(";").strip()
@@ -561,6 +577,79 @@ def page_followup():
     live_followup()
 
 
+EDIT_COLS = ["full_name", "type", "phone", "email", "group", "role", "status", "date_joined", "first_visit",
+             "invited_by", "follow_up"]
+STATUSES = ["", "Active", "Inactive", "Moved", "Left", "Transferred", "Deceased"]
+
+
+def _as_date(v):
+    d = pd.to_datetime(v, errors="coerce")
+    return None if pd.isna(d) else d.date()
+
+
+def register_editor(store):
+    """Editable register: click a cell, type, then Save. Rows are never deleted here — set Status instead."""
+    m = pd.DataFrame(store.list_members())
+    if m.empty:
+        st.info("No members yet — use **Import CSV** to load your register.")
+        return
+    for c in EDIT_COLS:
+        if c not in m.columns:
+            m[c] = ""
+    m = m.set_index("id")[EDIT_COLS].fillna("")
+    for c in ("date_joined", "first_visit"):
+        m[c] = m[c].map(_as_date)
+    extra = sorted({s for s in m.status.unique() if s and s not in STATUSES})
+    q = st.text_input("Search", placeholder="Filter by name, group, phone…", key="reg_q")
+    view = m if not q else m[m.apply(lambda r: q.lower() in " ".join(map(str, r)).lower(), axis=1)]
+    view = view.sort_values("full_name", key=lambda s: s.str.lower())
+    st.caption(f"{len(view)} of {len(m)} people · click a cell to edit, then **Save changes**. "
+               "To take someone off the lists, set Status to Moved/Inactive (their history is kept).")
+    edited = st.data_editor(
+        view, key=f"reg_{q}", hide_index=True, width="stretch", height=520, num_rows="fixed",
+        column_config={
+            "full_name": st.column_config.TextColumn("Name", required=True, max_chars=100),
+            "type": st.column_config.SelectboxColumn("Type", options=["member", "first_timer"], required=True),
+            "phone": st.column_config.TextColumn("Phone", max_chars=30),
+            "email": st.column_config.TextColumn("Email", max_chars=120),
+            "group": st.column_config.TextColumn("Group"),
+            "role": st.column_config.TextColumn("Ministry / role"),
+            "status": st.column_config.SelectboxColumn("Status", options=STATUSES + extra),
+            "date_joined": st.column_config.DateColumn("Joined", format="DD/MM/YYYY"),
+            "first_visit": st.column_config.DateColumn("First visit", format="DD/MM/YYYY"),
+            "invited_by": st.column_config.TextColumn("Invited by"),
+            "follow_up": st.column_config.TextColumn("Follow-up notes"),
+        })
+    changes = {}
+    for mid in edited.index:
+        diff = {}
+        for c in EDIT_COLS:
+            old, new = view.at[mid, c], edited.at[mid, c]
+            old = "" if old is None or (not isinstance(old, str) and pd.isna(old)) else old
+            new = "" if new is None or (not isinstance(new, str) and pd.isna(new)) else new
+            if hasattr(new, "isoformat"):
+                new = new.isoformat()[:10]
+            if hasattr(old, "isoformat"):
+                old = old.isoformat()[:10]
+            if str(old) != str(new):
+                diff[c] = new.strip() if isinstance(new, str) else new
+        if diff:
+            changes[mid] = diff
+    a, b = st.columns([1, 4], vertical_alignment="center")
+    save = a.button(f"Save changes ({len(changes)})", type="primary", disabled=not changes, icon=":material/save:")
+    if changes:
+        b.caption("Unsaved: " + ", ".join(edited.at[mid, "full_name"] or "(no name)" for mid in list(changes)[:6])
+                  + ("…" if len(changes) > 6 else ""))
+    if save:
+        if any(not str(edited.at[mid, "full_name"]).strip() for mid in changes):
+            st.error("Every person needs a name.")
+        else:
+            n = store.update_members(changes)
+            st.session_state.pop(f"reg_{q}", None)
+            st.toast(f"Saved {n} {'person' if n == 1 else 'people'}.", icon=":material/check_circle:")
+            st.rerun()
+
+
 def page_members():
     store = get_store()
     header("Members", "Your register and first-timers, stored in the database", store)
@@ -570,16 +659,7 @@ def page_members():
     tab_list, tab_add, tab_import, tab_setup = st.tabs(["Register", "Add person", "Import CSV", "Setup"])
 
     with tab_list:
-        m = pd.DataFrame(store.list_members())
-        if m.empty:
-            st.info("No members yet — use **Import CSV** to load your register.")
-        else:
-            cols = [c for c in ["full_name", "type", "phone", "email", "group", "role", "status", "date_joined",
-                                "first_visit", "invited_by"] if c in m.columns]
-            st.dataframe(m[cols].sort_values("full_name", key=lambda s: s.str.lower()), hide_index=True,
-                         width="stretch", height=520,
-                         column_config={"full_name": "Name", "type": "Type", "date_joined": "Joined",
-                                        "first_visit": "First visit", "invited_by": "Invited by"})
+        register_editor(store)
 
     with tab_add:
         with st.form("member_add", clear_on_submit=True):
