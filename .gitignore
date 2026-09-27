@@ -3,3 +3,11 @@ __pycache__/
 .venv/
 .DS_Store
 data/*.csv.gz
+
+# never commit real member data or credentials (public repo)
+*.csv
+*.xlsx
+.streamlit/secrets.toml
+*service-account*.json
+*credentials*.json
+*-key.json

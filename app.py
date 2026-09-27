@@ -85,6 +85,39 @@ def card(where, fig):
         st.plotly_chart(fig, width="stretch", config=PLOT_CFG)
 
 
+# ---------- navigation (declared early so attendance pages skip the heavy age data) ----------
+def _lazy(name):
+    """Page wrapper that looks the page function up at run time (age pages are defined further down)."""
+    def run():
+        globals()[name]()
+    run.__name__ = name
+    return run
+
+
+import attendance  # noqa: E402
+
+pg = st.navigation({
+    "Attendance": [
+        st.Page(attendance.page_checkin, title="Check-in", icon=":material/how_to_reg:", url_path="checkin"),
+        st.Page(attendance.page_followup, title="Follow-up", icon=":material/notification_important:", url_path="followup",
+                default=True),
+        st.Page(attendance.page_members, title="Members", icon=":material/badge:", url_path="members"),
+    ],
+    "Age dashboard": [
+        st.Page(_lazy("page_overview"), title="Overview", icon=":material/dashboard:", url_path="overview"),
+        st.Page(_lazy("page_live"), title="Live activity", icon=":material/sensors:", url_path="live"),
+        st.Page(_lazy("page_compare"), title="Compare groups", icon=":material/compare_arrows:", url_path="compare"),
+        st.Page(_lazy("page_pyramid"), title="Age pyramid", icon=":material/groups:", url_path="pyramid"),
+        st.Page(_lazy("page_churches"), title="All churches", icon=":material/church:", url_path="churches"),
+        st.Page(_lazy("page_profile"), title="Church profile", icon=":material/search:", url_path="profile"),
+        st.Page(_lazy("page_about"), title="About the data", icon=":material/info:", url_path="about"),
+    ],
+})
+if pg.title in ("Check-in", "Follow-up", "Members"):
+    pg.run()
+    st.stop()
+
+
 # ---------- data (built once per server, shared by every viewer) ----------
 # st.cache_resource hands back the same objects without copying, which matters for ~1.3M-row frames;
 # nothing below mutates the cached frames.
@@ -507,17 +540,4 @@ def page_about():
         "**Theme:** the dashboard follows your device's light or dark mode automatically.")
 
 
-pg = st.navigation({
-    "Dashboard": [
-        st.Page(page_overview, title="Overview", icon=":material/dashboard:", url_path="overview", default=True),
-        st.Page(page_live, title="Live activity", icon=":material/sensors:", url_path="live"),
-        st.Page(page_compare, title="Compare groups", icon=":material/compare_arrows:", url_path="compare"),
-        st.Page(page_pyramid, title="Age pyramid", icon=":material/groups:", url_path="pyramid"),
-    ],
-    "Churches": [
-        st.Page(page_churches, title="All churches", icon=":material/church:", url_path="churches"),
-        st.Page(page_profile, title="Church profile", icon=":material/search:", url_path="profile"),
-    ],
-    "Info": [st.Page(page_about, title="About the data", icon=":material/info:", url_path="about")],
-})
 pg.run()
