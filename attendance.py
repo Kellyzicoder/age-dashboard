@@ -575,8 +575,8 @@ def hero_html(eyebrow: str, title: str, subtitle: str, chips: list[str], live: b
 
 
 def header(title: str, subtitle: str, store, live: bool = False):
-    badge = "Demo data (invented names · SQLite)" if store.demo else "Connected · Postgres database"
-    st.html(hero_html("Favourite Child Church · Attendance", title, subtitle, [badge], live))
+    chips = ["Demo data — invented names"] if store.demo else []
+    st.html(hero_html("Favourite Child Church · Attendance", title, subtitle, chips, live))
 
 
 def gate(store) -> bool:
@@ -748,12 +748,13 @@ def page_followup():
 
 EDIT_COLS = ["full_name", "type", "phone", "email", "group", "role", "status", "date_joined", "first_visit",
              "invited_by", "follow_up"]
-STATUSES = ["", "Active", "Inactive", "Moved", "Left", "Transferred", "Deceased"]
+STATUSES = ["Active", "Inactive", "Moved", "Left", "Transferred", "Deceased"]
 
 
-def _as_date(v):
+def _as_date(v) -> str:
+    """Stored ISO date → 'DD/MM/YYYY' for the editor ('' when empty, so the cell shows blank, not None)."""
     d = pd.to_datetime(v, errors="coerce")
-    return None if pd.isna(d) else d.date()
+    return "" if pd.isna(d) else d.strftime("%d/%m/%Y")
 
 
 def register_editor(store):
@@ -768,6 +769,7 @@ def register_editor(store):
     m = m.set_index("id")[EDIT_COLS].fillna("")
     for c in ("date_joined", "first_visit"):
         m[c] = m[c].map(_as_date)
+    m["status"] = m["status"].map(lambda v: v or "Active")  # blank status means active
     extra = sorted({s for s in m.status.unique() if s and s not in STATUSES})
     q = st.text_input("Search", placeholder="Filter by name, group, phone…", key="reg_q")
     view = m if not q else m[m.apply(lambda r: q.lower() in " ".join(map(str, r)).lower(), axis=1)]
@@ -784,24 +786,29 @@ def register_editor(store):
             "group": st.column_config.TextColumn("Group"),
             "role": st.column_config.TextColumn("Ministry / role"),
             "status": st.column_config.SelectboxColumn("Status", options=STATUSES + extra),
-            "date_joined": st.column_config.DateColumn("Joined", format="DD/MM/YYYY"),
-            "first_visit": st.column_config.DateColumn("First visit", format="DD/MM/YYYY"),
+            "date_joined": st.column_config.TextColumn("Joined", help="DD/MM/YYYY", max_chars=10),
+            "first_visit": st.column_config.TextColumn("First visit", help="DD/MM/YYYY", max_chars=10),
             "invited_by": st.column_config.TextColumn("Invited by"),
             "follow_up": st.column_config.TextColumn("Follow-up notes"),
         })
-    changes = {}
+    changes, bad_dates = {}, []
     for mid in edited.index:
         diff = {}
         for c in EDIT_COLS:
             old, new = view.at[mid, c], edited.at[mid, c]
-            old = "" if old is None or (not isinstance(old, str) and pd.isna(old)) else old
-            new = "" if new is None or (not isinstance(new, str) and pd.isna(new)) else new
-            if hasattr(new, "isoformat"):
-                new = new.isoformat()[:10]
-            if hasattr(old, "isoformat"):
-                old = old.isoformat()[:10]
-            if str(old) != str(new):
-                diff[c] = new.strip() if isinstance(new, str) else new
+            old = "" if old is None or (not isinstance(old, str) and pd.isna(old)) else str(old).strip()
+            new = "" if new is None or (not isinstance(new, str) and pd.isna(new)) else str(new).strip()
+            if c == "status":
+                old, new = ("" if v == "Active" else v for v in (old, new))
+            if c in ("date_joined", "first_visit"):
+                old = _date(old)
+                parsed = _date(new)
+                if new and not parsed:
+                    bad_dates.append(f"{edited.at[mid, 'full_name']}: “{new}”")
+                    continue
+                new = parsed
+            if old != new:
+                diff[c] = new
         if diff:
             changes[mid] = diff
     a, b = st.columns([1, 4], vertical_alignment="center")
@@ -812,6 +819,8 @@ def register_editor(store):
     if save:
         if any(not str(edited.at[mid, "full_name"]).strip() for mid in changes):
             st.error("Every person needs a name.")
+        elif bad_dates:
+            st.error("Dates need to look like 25/12/2025 — check: " + "; ".join(bad_dates[:5]))
         else:
             n = store.update_members(changes)
             st.session_state.pop(f"reg_{q}", None)
