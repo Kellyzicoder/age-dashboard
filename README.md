@@ -3,15 +3,15 @@
 Attendance tracking for **Favourite Child Church**: ushers tick people in on their phones, leaders see who has been
 missing and follow up.
 
-**Live:** https://kelly-age-dashboard.streamlit.app
+**Live:** https://fcc-attendance.streamlit.app
 
 ## Pages
 
 | Page | What it does |
 |---|---|
-| Follow-up (home) | Priority list of who's been missing: 🟡 **yellow** = 3–4 services missed in a row, 🔴 **red** = 5+ in a row. Red first; download as CSV. |
+| Check-in (home) | Ushers tick people as they arrive; ticks from every phone appear for everyone within ~5 seconds. Quick "add first-timer" form. |
+| Follow-up | Priority list of who's been missing: 🟡 **yellow** = 3–4 services missed in a row, 🔴 **red** = 5+ in a row. Red first; download as CSV. |
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
-| Check-in | Ushers tick people as they arrive; ticks from every phone appear for everyone within ~5 seconds. Quick "add first-timer" form. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
 | Members | The register (members + first-timers), add people, and import the Google Sheets CSV exports. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |

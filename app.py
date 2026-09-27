@@ -1,6 +1,6 @@
 """FCC Attendance Tracker — Streamlit app for Favourite Child Church.
 
-Pages (sidebar): Follow-up (home) · Live · Check-in · Insights · Members · SQL.
+Pages (sidebar): Check-in (home) · Follow-up · Live · Insights · Members · SQL.
 All data lives in Postgres (Supabase) via `database_url` in Streamlit secrets; see attendance.py.
 """
 from pathlib import Path
@@ -43,10 +43,9 @@ import attendance as A  # noqa: E402
 
 pg = st.navigation({
     "Attendance": [
-        st.Page(A.page_followup, title="Follow-up", icon=":material/notification_important:", url_path="followup",
-                default=True),
+        st.Page(A.page_checkin, title="Check-in", icon=":material/how_to_reg:", url_path="checkin", default=True),
+        st.Page(A.page_followup, title="Follow-up", icon=":material/notification_important:", url_path="followup"),
         st.Page(A.page_live, title="Live", icon=":material/sensors:", url_path="live"),
-        st.Page(A.page_checkin, title="Check-in", icon=":material/how_to_reg:", url_path="checkin"),
         st.Page(A.page_insights, title="Insights", icon=":material/insights:", url_path="insights"),
     ],
     "Admin": [
