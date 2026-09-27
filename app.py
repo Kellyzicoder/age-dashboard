@@ -102,6 +102,7 @@ pg = st.navigation({
         st.Page(attendance.page_followup, title="Follow-up", icon=":material/notification_important:", url_path="followup",
                 default=True),
         st.Page(attendance.page_members, title="Members", icon=":material/badge:", url_path="members"),
+        st.Page(attendance.page_sql, title="SQL", icon=":material/database:", url_path="sql"),
     ],
     "Age dashboard": [
         st.Page(_lazy("page_overview"), title="Overview", icon=":material/dashboard:", url_path="overview"),
@@ -113,7 +114,7 @@ pg = st.navigation({
         st.Page(_lazy("page_about"), title="About the data", icon=":material/info:", url_path="about"),
     ],
 })
-if pg.title in ("Check-in", "Follow-up", "Members"):
+if pg.title in ("Check-in", "Follow-up", "Members", "SQL"):
     pg.run()
     st.stop()
 

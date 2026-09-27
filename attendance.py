@@ -1,13 +1,15 @@
-"""Attendance: live check-in, missed-service follow-up, and member register.
+"""Attendance: live check-in, missed-service follow-up, member register and a SQL query page.
 
-Data lives in Google Cloud Firestore when `gcp_service_account` is set in Streamlit secrets;
-otherwise a shared in-memory demo store with invented names is used. Real member data is never
-stored in this repository.
+Storage is a plain SQL database, so you can query it directly:
+  • Postgres (Supabase or Neon) when `database_url` is set in Streamlit secrets — the real data;
+  • otherwise a local SQLite demo database filled with invented names (reset whenever the app restarts).
+Real member data is never stored in this repository.
 
-Firestore layout (small on purpose, so live polling stays within the free tier):
-  members/{member_id}   full_name, phone, email, group, role, status, type ("member"|"first_timer"),
-                        date_joined, first_visit, invited_by, follow_up, created_at
-  services/{YYYY-MM-DD} name, date, present: {member_id: ISO timestamp}   ← one read per live refresh
+Tables (same in SQLite and Postgres):
+  members(id, full_name, phone, email, group_name, role, status, type, date_joined, first_visit,
+          invited_by, follow_up, created_at)
+  services(service_date PRIMARY KEY, name)
+  attendance(service_date, member_id, checked_at, PRIMARY KEY (service_date, member_id))
 """
 from __future__ import annotations
 
@@ -43,83 +45,88 @@ def new_id() -> str:
     return uuid.uuid4().hex[:12]
 
 
-# ---------------------------------------------------------------- storage backends
-class DemoStore:
-    """Shared in-memory store with invented people, so the pages work before Firestore is set up."""
-    demo = True
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        rng = np.random.default_rng(7)
-        first = ["Ama", "Kwame", "Esi", "Kojo", "Abena", "Yaw", "Akosua", "Kofi", "Adwoa", "Kwabena", "Efua", "Kwaku",
-                 "Afia", "Kweku", "Aba", "Fiifi", "Naana", "Paa", "Serwaa", "Ekow", "Mia", "Leo", "Zoe", "Eli", "Ruth",
-                 "Noah", "Tia", "Sam", "Joy", "Ben"]
-        last = ["Asante", "Owusu", "Boateng", "Appiah", "Darko", "Ofori", "Quaye", "Tetteh", "Addo", "Badu"]
-        names = sorted({f"{rng.choice(first)} {rng.choice(last)}" for _ in range(80)})[:60]
-        groups = ["Choir", "Ushering", "Youth", "Media", "Children", "Men", "Women", ""]
-        self.members = {}
-        for n in names:
-            mid = new_id()
-            self.members[mid] = dict(full_name=n, phone=f"021 {rng.integers(100, 999)} {rng.integers(1000, 9999)}",
-                                     email="", group=str(rng.choice(groups)), role="", status="", type="member",
-                                     date_joined="", first_visit="", invited_by="", follow_up="", created_at=now_iso())
-        # 12 past Sundays; each person has a personal attendance habit, a few have recently stopped coming
-        sundays = [today() - dt.timedelta(days=(today().weekday() + 1) % 7 + 7 * k) for k in range(12)][::-1]
-        habit = {m: rng.beta(6, 2) for m in self.members}
-        stopped = {m: int(rng.integers(3, 9)) for m in rng.choice(list(self.members), 9, replace=False)}
-        self.services = {}
-        for i, d in enumerate(sundays):
-            present = {}
-            for m, p in habit.items():
-                if m in stopped and i >= len(sundays) - stopped[m]:
-                    continue
-                if rng.random() < p:
-                    present[m] = dt.datetime.combine(d, dt.time(10, int(rng.integers(0, 40))), TZ).isoformat()
-            self.services[d.isoformat()] = dict(name="Sunday Service", date=d.isoformat(), present=present)
-
-    def list_members(self):
-        return [dict(v, id=k) for k, v in self.members.items()]
-
-    def list_services(self):
-        return [dict(v) for v in self.services.values()]
-
-    def get_service(self, date: str):
-        s = self.services.get(date)
-        return dict(s, present=dict(s["present"])) if s else None
-
-    def ensure_service(self, date: str, name: str):
-        with self._lock:
-            s = self.services.setdefault(date, dict(name=name, date=date, present={}))
-            s["name"] = name or s["name"]
-
-    def set_present(self, date: str, mid: str, present: bool, name: str = "Sunday Service"):
-        with self._lock:
-            s = self.services.setdefault(date, dict(name=name, date=date, present={}))
-            if present:
-                s["present"][mid] = now_iso()
-            else:
-                s["present"].pop(mid, None)
-
-    def upsert_members(self, rows: list[dict]):
-        with self._lock:
-            for r in rows:
-                mid = r.pop("id", None) or new_id()
-                self.members[mid] = {**self.members.get(mid, {}), **r}
-        return len(rows)
+# ---------------------------------------------------------------- storage (SQL: SQLite demo or Postgres)
+MEMBER_COLS = ["full_name", "phone", "email", "group_name", "role", "status", "type", "date_joined", "first_visit",
+               "invited_by", "follow_up", "created_at"]
+SCHEMA = [
+    """CREATE TABLE IF NOT EXISTS members (
+        id TEXT PRIMARY KEY, full_name TEXT NOT NULL, phone TEXT, email TEXT, group_name TEXT, role TEXT,
+        status TEXT, type TEXT DEFAULT 'member', date_joined DATE, first_visit DATE, invited_by TEXT,
+        follow_up TEXT, created_at TEXT)""",
+    "CREATE TABLE IF NOT EXISTS services (service_date DATE PRIMARY KEY, name TEXT)",
+    """CREATE TABLE IF NOT EXISTS attendance (
+        service_date DATE NOT NULL REFERENCES services(service_date) ON DELETE CASCADE,
+        member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
+        checked_at TEXT, PRIMARY KEY (service_date, member_id))""",
+    "CREATE INDEX IF NOT EXISTS attendance_member ON attendance(member_id)",
+]
 
 
-class FirestoreStore:
-    """Google Cloud Firestore backend. Credentials come from st.secrets['gcp_service_account']."""
-    demo = False
+def _txt(v) -> str:
+    """Normalise DB values (Postgres returns date objects, SQLite returns strings) to plain strings."""
+    if v is None:
+        return ""
+    return v.isoformat() if hasattr(v, "isoformat") else str(v)
 
-    def __init__(self, info: dict):
-        from google.cloud import firestore
-        from google.oauth2 import service_account
-        self._fs = firestore
-        creds = service_account.Credentials.from_service_account_info(dict(info))
-        self.db = firestore.Client(project=info["project_id"], credentials=creds)
+
+class SqlStore:
+    """One store for both engines. Queries use standard SQL that runs unchanged on SQLite and Postgres."""
+
+    def __init__(self, url: str | None):
+        self.demo = not url
+        self.url = url
+        self.engine = "sqlite" if self.demo else "postgres"
+        self.path = "/tmp/fcc_attendance_demo.db"
+        self._lock = threading.RLock()
+        self._conn = None
         self._cache = {}
-        self._lock = threading.Lock()
+        if self.demo:
+            import os
+            if os.path.exists(self.path):
+                os.remove(self.path)  # fresh demo on every app start
+        with self._lock:
+            for stmt in SCHEMA:
+                self._exec(stmt)
+        if self.demo:
+            _seed_demo(self)
+
+    # -- connection handling
+    def _connect(self):
+        if self.demo:
+            import sqlite3
+            c = sqlite3.connect(self.path, check_same_thread=False, isolation_level=None)
+            c.execute("PRAGMA foreign_keys = ON")
+            c.execute("PRAGMA journal_mode = WAL")
+            return c
+        import psycopg
+        return psycopg.connect(self.url, autocommit=True, connect_timeout=10)
+
+    def _q(self, sql: str) -> str:
+        return sql if self.demo else sql.replace("?", "%s")
+
+    def _exec(self, sql, params=(), many=False, fetch=False):
+        with self._lock:
+            for attempt in (1, 2):  # one reconnect if the server dropped the connection
+                try:
+                    if self._conn is None:
+                        self._conn = self._connect()
+                    cur = self._conn.cursor()
+                    if many:
+                        cur.executemany(self._q(sql), params)
+                    else:
+                        cur.execute(self._q(sql), params)
+                    if fetch:
+                        cols = [d[0] for d in cur.description]
+                        return [dict(zip(cols, r)) for r in cur.fetchall()]
+                    return None
+                except Exception:
+                    if attempt == 2 or self.demo:
+                        raise
+                    try:
+                        self._conn.close()
+                    except Exception:
+                        pass
+                    self._conn = None
 
     def _cached(self, key, ttl, fn):
         now = dt.datetime.now().timestamp()
@@ -130,54 +137,139 @@ class FirestoreStore:
         self._cache[key] = (now, val)
         return val
 
-    def _drop(self, *keys):
-        for k in keys:
-            self._cache.pop(k, None)
-
+    # -- reads
     def list_members(self):
-        return self._cached("members", 120, lambda: [dict(d.to_dict(), id=d.id)
-                                                     for d in self.db.collection("members").stream()])
+        def load():
+            rows = self._exec("SELECT * FROM members", fetch=True)
+            return [{k: _txt(v) for k, v in r.items()} | {"group": _txt(r.get("group_name"))} for r in rows]
+        return self._cached("members", 60, load)
 
     def list_services(self):
-        return self._cached("services", 20, lambda: [d.to_dict() for d in self.db.collection("services").stream()])
+        def load():
+            svcs = {_txt(r["service_date"]): dict(date=_txt(r["service_date"]), name=r["name"] or "", present={})
+                    for r in self._exec("SELECT service_date, name FROM services", fetch=True)}
+            for r in self._exec("SELECT service_date, member_id, checked_at FROM attendance", fetch=True):
+                s = svcs.get(_txt(r["service_date"]))
+                if s is not None:
+                    s["present"][r["member_id"]] = _txt(r["checked_at"])
+            return list(svcs.values())
+        return self._cached("services", 15, load)
 
-    def get_service(self, date: str):  # always fresh: this is the live-poll read (1 document)
-        snap = self.db.collection("services").document(date).get()
-        return snap.to_dict() if snap.exists else None
+    def get_service(self, date: str):  # live-poll read: small and always fresh
+        rows = self._exec("SELECT a.member_id, a.checked_at, s.name FROM services s "
+                          "LEFT JOIN attendance a ON a.service_date = s.service_date WHERE s.service_date = ?",
+                          (date,), fetch=True)
+        if not rows:
+            return None
+        return dict(date=date, name=rows[0]["name"] or "",
+                    present={r["member_id"]: _txt(r["checked_at"]) for r in rows if r["member_id"]})
 
+    # -- writes
     def ensure_service(self, date: str, name: str):
-        self.db.collection("services").document(date).set({"name": name, "date": date}, merge=True)
-        self._drop("services")
+        self._exec("INSERT INTO services (service_date, name) VALUES (?, ?) "
+                   "ON CONFLICT (service_date) DO UPDATE SET name = excluded.name", (date, name or "Service"))
+        self._cache.pop("services", None)
 
     def set_present(self, date: str, mid: str, present: bool, name: str = "Sunday Service"):
-        ref = self.db.collection("services").document(date)
-        if present:  # merge=True deep-merges the map, so concurrent ticks from several phones don't clash
-            ref.set({"name": name, "date": date, "present": {mid: now_iso()}}, merge=True)
+        if present:
+            self._exec("INSERT INTO services (service_date, name) VALUES (?, ?) ON CONFLICT (service_date) DO NOTHING",
+                       (date, name))
+            self._exec("INSERT INTO attendance (service_date, member_id, checked_at) VALUES (?, ?, ?) "
+                       "ON CONFLICT (service_date, member_id) DO NOTHING", (date, mid, now_iso()))
         else:
-            ref.update({f"present.{mid}": self._fs.DELETE_FIELD})
-        self._drop("services")
+            self._exec("DELETE FROM attendance WHERE service_date = ? AND member_id = ?", (date, mid))
+        self._cache.pop("services", None)
 
     def upsert_members(self, rows: list[dict]):
-        n = 0
-        for i in range(0, len(rows), 400):
-            batch = self.db.batch()
-            for r in rows[i:i + 400]:
-                r = dict(r)
-                mid = r.pop("id", None) or new_id()
-                batch.set(self.db.collection("members").document(mid), r, merge=True)
-                n += 1
-            batch.commit()
-        self._drop("members")
-        return n
+        existing = {r["id"] for r in self._exec("SELECT id FROM members", fetch=True)}
+        inserts, updates = [], []
+        for r in rows:
+            r = dict(r)
+            if "group" in r:
+                r["group_name"] = r.pop("group")
+            mid = r.pop("id", None) or new_id()
+            vals = [None if (r.get(c) == "" and c in ("date_joined", "first_visit")) else r.get(c) for c in MEMBER_COLS]
+            (updates if mid in existing else inserts).append((mid, vals))
+        if inserts:
+            cols = ", ".join(["id"] + MEMBER_COLS)
+            marks = ", ".join(["?"] * (len(MEMBER_COLS) + 1))
+            self._exec(f"INSERT INTO members ({cols}) VALUES ({marks}) ON CONFLICT (id) DO NOTHING",
+                       [[mid] + vals for mid, vals in inserts], many=True)
+        if updates:  # only overwrite fields that were provided; COALESCE keeps what's already stored
+            sets = ", ".join(f"{c} = COALESCE(?, {c})" for c in MEMBER_COLS)
+            self._exec(f"UPDATE members SET {sets} WHERE id = ?", [vals + [mid] for mid, vals in updates], many=True)
+        self._cache.pop("members", None)
+        return len(rows)
+
+    # -- read-only SQL for the query page
+    def run_query(self, sql: str, limit: int = 5000) -> pd.DataFrame:
+        sql = sql.strip().rstrip(";").strip()
+        if not sql:
+            raise ValueError("Type a query first.")
+        if ";" in sql:
+            raise ValueError("Run one statement at a time.")
+        if self.demo:
+            import sqlite3
+            conn = sqlite3.connect(f"file:{self.path}?mode=ro", uri=True)  # read-only at the file level
+            try:
+                cur = conn.execute(sql)
+                cols = [d[0] for d in cur.description or []]
+                return pd.DataFrame(cur.fetchmany(limit), columns=cols)
+            finally:
+                conn.close()
+        import psycopg
+        with psycopg.connect(self.readonly_url or self.url, connect_timeout=10) as conn:
+            with conn.cursor() as cur:
+                cur.execute("SET TRANSACTION READ ONLY")         # the database itself refuses any write
+                cur.execute("SET LOCAL statement_timeout = '15s'")
+                cur.execute(sql)
+                cols = [d[0] for d in cur.description or []]
+                rows = cur.fetchmany(limit)
+            conn.rollback()
+        return pd.DataFrame(rows, columns=cols)
+
+    readonly_url = None
 
 
-@st.cache_resource(show_spinner=False)
+def _seed_demo(store: "SqlStore"):
+    """Invented people + 12 past Sundays of attendance, with a few people who recently stopped coming."""
+    rng = np.random.default_rng(7)
+    first = ["Ama", "Kwame", "Esi", "Kojo", "Abena", "Yaw", "Akosua", "Kofi", "Adwoa", "Kwabena", "Efua", "Kwaku",
+             "Afia", "Kweku", "Aba", "Fiifi", "Naana", "Paa", "Serwaa", "Ekow", "Mia", "Leo", "Zoe", "Eli", "Ruth",
+             "Noah", "Tia", "Sam", "Joy", "Ben"]
+    last = ["Asante", "Owusu", "Boateng", "Appiah", "Darko", "Ofori", "Quaye", "Tetteh", "Addo", "Badu"]
+    names = sorted({f"{rng.choice(first)} {rng.choice(last)}" for _ in range(80)})[:60]
+    groups = ["Choir", "Ushering", "Youth", "Media", "Children", "Men", "Women", ""]
+    people = [dict(id=new_id(), full_name=n, phone=f"021 {rng.integers(100, 999)} {rng.integers(1000, 9999)}",
+                   email="", group=str(rng.choice(groups)), role="", status="", type="member", date_joined="",
+                   first_visit="", invited_by="", follow_up="", created_at=now_iso()) for n in names]
+    store.upsert_members([dict(p) for p in people])
+    ids = [p["id"] for p in people]
+    sundays = [today() - dt.timedelta(days=(today().weekday() + 1) % 7 + 7 * k) for k in range(12)][::-1]
+    habit = {m: rng.beta(6, 2) for m in ids}
+    stopped = {m: int(rng.integers(3, 9)) for m in rng.choice(ids, 9, replace=False)}
+    svc, att = [], []
+    for i, d in enumerate(sundays):
+        svc.append((d.isoformat(), "Sunday Service"))
+        for m, p in habit.items():
+            if m in stopped and i >= len(sundays) - stopped[m]:
+                continue
+            if rng.random() < p:
+                att.append((d.isoformat(), m, dt.datetime.combine(d, dt.time(10, int(rng.integers(0, 40))), TZ).isoformat()))
+    store._exec("INSERT INTO services (service_date, name) VALUES (?, ?)", svc, many=True)
+    store._exec("INSERT INTO attendance (service_date, member_id, checked_at) VALUES (?, ?, ?)", att, many=True)
+
+
+@st.cache_resource(show_spinner="Connecting to the database…")
 def get_store():
     try:
-        info = st.secrets.get("gcp_service_account")
+        url = st.secrets.get("database_url")
+        ro = st.secrets.get("database_url_readonly")
     except Exception:
-        info = None
-    return FirestoreStore(info) if info else DemoStore()
+        url = ro = None
+    store = SqlStore(url or None)
+    store.readonly_url = ro or None
+    return store
 
 
 # ---------------------------------------------------------------- follow-up logic
@@ -286,7 +378,7 @@ def parse_registers(register: pd.DataFrame | None, first_timers: pd.DataFrame | 
 
 # ---------------------------------------------------------------- page helpers
 def header(title: str, subtitle: str, store, live: bool = False):
-    badge = "Demo data (invented names)" if store.demo else "Connected · Google Cloud Firestore"
+    badge = "Demo data (invented names · SQLite)" if store.demo else "Connected · Postgres database"
     dot = '<span class="live-dot"></span>' if live else ""
     st.html(f'<div class="hero"><div class="eyebrow">⛪ Attendance</div><h1>{dot}{title}</h1><p>{subtitle}</p>'
             f'<span class="chip">{badge}</span></div>')
@@ -317,7 +409,7 @@ def gate(store) -> bool:
 
 def demo_note(store):
     if store.demo:
-        st.info("These pages are showing **invented demo people**. Connect Firestore (see *Members → Setup*) "
+        st.info("These pages are showing **invented demo people**. Connect your Postgres database (see *Members → Setup*) "
                 "to use your real register.", icon=":material/science:")
 
 
@@ -501,28 +593,123 @@ def page_members():
 
 
 SETUP_GUIDE = """
-**Connect Google Cloud Firestore** (free tier is plenty for this):
+**Connect a Postgres database** — Supabase (recommended: login, table editor, SQL editor) or Neon. Both have free plans.
 
-1. Go to **console.firebase.google.com** → *Add project* (or use an existing Google Cloud project).
-2. *Build → Firestore Database → Create database* → **Production mode** → pick a region near you (e.g. `australia-southeast1`).
-3. In **console.cloud.google.com** → *IAM & Admin → Service Accounts* → *Create service account*,
-   give it the role **Cloud Datastore User**, then *Keys → Add key → JSON*. A `.json` file downloads.
-4. On **share.streamlit.io** → your app → ⋮ → *Settings → Secrets*, paste:
+**Supabase**
+1. Sign up at **supabase.com** → *New project* → choose a region near you (e.g. Sydney) and a database password.
+2. Click **Connect** (top of the project) → *Connection string* → **Session pooler** → copy the URI
+   (it looks like `postgresql://postgres.xxxx:[YOUR-PASSWORD]@aws-0-….pooler.supabase.com:5432/postgres`)
+   and put your database password in place of `[YOUR-PASSWORD]`.
+   Free Supabase projects pause after 7 days with no activity — weekly check-ins keep it awake; if it pauses,
+   click *Restore* in Supabase.
+
+**Neon** (alternative)
+1. Sign up at **neon.tech** (or *Vercel → Storage → Neon*) → create a project → copy the connection string.
+
+**Then, on share.streamlit.io** → your app → ⋮ → *Settings → Secrets*, paste:
 
 ```toml
 attendance_password = "choose-a-strong-password"
-
-[gcp_service_account]
-type = "service_account"
-project_id = "your-project-id"
-private_key_id = "…"
-private_key = "-----BEGIN PRIVATE KEY-----\\n…\\n-----END PRIVATE KEY-----\\n"
-client_email = "…@your-project-id.iam.gserviceaccount.com"
-client_id = "…"
-token_uri = "https://oauth2.googleapis.com/token"
+database_url = "postgresql://…your connection string…?sslmode=require"
 ```
-   (copy each value from the downloaded JSON file). Save — the app restarts and switches from demo to your database.
-5. Open **Members → Import CSV** and upload your two sheets.
+Save — the app restarts, creates its three tables, and switches from demo to your database.
+Then open **Members → Import CSV** and upload your two sheets.
 
-Never commit the JSON key or your CSVs to GitHub — the repo is public. Both are blocked in `.gitignore`.
+Optional, for the SQL page: create a read-only database user and add its URI as `database_url_readonly`.
+The SQL page already runs every query in a read-only transaction, so it cannot change data either way.
+
+You can also query the same tables in Supabase's own **SQL editor**, or from Python on your laptop:
+
+```python
+import pandas as pd, psycopg
+with psycopg.connect("postgresql://…") as conn:
+    df = pd.read_sql("SELECT * FROM attendance", conn)
+```
+
+Never commit connection strings or your CSVs to GitHub — the repo is public. Both are blocked in `.gitignore`.
 """
+
+
+EXAMPLES = {
+    "Attendance per service": """SELECT s.service_date, s.name, COUNT(a.member_id) AS present
+FROM services s
+LEFT JOIN attendance a ON a.service_date = s.service_date
+GROUP BY s.service_date, s.name
+ORDER BY s.service_date DESC""",
+    "Missed in a row (who to call)": """WITH last_seen AS (
+  SELECT m.id, m.full_name, m.phone, MAX(a.service_date) AS last_seen
+  FROM members m
+  LEFT JOIN attendance a ON a.member_id = m.id
+  GROUP BY m.id, m.full_name, m.phone
+)
+SELECT l.full_name, l.phone, l.last_seen,
+       (SELECT COUNT(*) FROM services s
+        WHERE s.service_date > COALESCE(l.last_seen, '1900-01-01')
+          AND s.service_date <= CURRENT_DATE) AS missed_in_a_row
+FROM last_seen l
+ORDER BY missed_in_a_row DESC, l.full_name""",
+    "Attendance rate per person": """SELECT m.full_name, m.group_name,
+       COUNT(a.member_id) AS attended,
+       (SELECT COUNT(*) FROM services) AS services,
+       ROUND(100.0 * COUNT(a.member_id) / NULLIF((SELECT COUNT(*) FROM services), 0), 1) AS rate_pct
+FROM members m
+LEFT JOIN attendance a ON a.member_id = m.id
+GROUP BY m.id, m.full_name, m.group_name
+ORDER BY rate_pct DESC""",
+    "First-timers: did they come back?": """SELECT m.full_name, m.first_visit, m.invited_by,
+       COUNT(a.member_id) AS visits, MAX(a.service_date) AS last_seen
+FROM members m
+LEFT JOIN attendance a ON a.member_id = m.id
+WHERE m.type = 'first_timer'
+GROUP BY m.id, m.full_name, m.first_visit, m.invited_by
+ORDER BY m.first_visit DESC""",
+    "Attendance by group": """SELECT COALESCE(NULLIF(m.group_name, ''), '(no group)') AS grp,
+       COUNT(DISTINCT m.id) AS people, COUNT(a.member_id) AS check_ins
+FROM members m
+LEFT JOIN attendance a ON a.member_id = m.id
+GROUP BY 1
+ORDER BY check_ins DESC""",
+    "Who invited the most first-timers": """SELECT invited_by, COUNT(*) AS first_timers
+FROM members
+WHERE invited_by IS NOT NULL AND invited_by <> ''
+GROUP BY invited_by
+ORDER BY first_timers DESC""",
+}
+
+
+def page_sql():
+    store = get_store()
+    header("SQL", "Ask the database anything — read-only, so nothing can be changed from here", store)
+    if not gate(store):
+        return
+    demo_note(store)
+    left, right = st.columns([1, 3])
+    with left.container(border=True):
+        st.markdown("**Tables**")
+        st.code("members\n  id, full_name, phone, email,\n  group_name, role, status, type,\n  date_joined, first_visit,\n"
+                "  invited_by, follow_up\n\nservices\n  service_date, name\n\nattendance\n"
+                "  service_date, member_id,\n  checked_at", language=None)
+        pick = st.selectbox("Example queries", list(EXAMPLES), index=None, placeholder="Pick an example…")
+        if pick and st.session_state.get("sql_pick") != pick:
+            st.session_state.sql_pick = pick
+            st.session_state.sql_text = EXAMPLES[pick]
+    with right:
+        st.session_state.setdefault("sql_text", EXAMPLES["Missed in a row (who to call)"])
+        sql = st.text_area("SQL", key="sql_text", height=230, label_visibility="collapsed")
+        run = st.button("Run query", type="primary", icon=":material/play_arrow:")
+        if run or "sql_result" not in st.session_state:
+            try:
+                t0 = dt.datetime.now()
+                df = store.run_query(sql)
+                st.session_state.sql_result = (df, (dt.datetime.now() - t0).total_seconds(), None)
+            except Exception as e:  # show the database's own error message
+                st.session_state.sql_result = (None, 0, str(e).strip().splitlines()[0][:400])
+        df, secs, err = st.session_state.sql_result
+        if err:
+            st.error(err, icon=":material/error:")
+        elif df is not None:
+            with st.container(border=True):
+                st.caption(f"{len(df):,} rows · {secs * 1000:.0f} ms" + (" · first 5,000 shown" if len(df) >= 5000 else ""))
+                st.dataframe(df, hide_index=True, width="stretch", height=min(38 * (len(df) + 1) + 4, 520))
+                st.download_button("Download results (CSV)", df.to_csv(index=False), "query_results.csv", "text/csv",
+                                   icon=":material/download:")

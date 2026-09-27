@@ -12,10 +12,13 @@ Interactive Streamlit dashboard showing how membership and the **age profile** o
 | Check-in | Ushers tick people as they arrive; ticks from every phone appear for everyone within ~5 seconds. Quick "add first-timer" form. |
 | Follow-up | Priority list of who's been missing: 🟡 **yellow** = 3–4 services missed in a row, 🔴 **red** = 5+ in a row. Red first, then yellow; download as CSV. |
 | Members | The register (members + first-timers), add people, and import your Google Sheets CSV exports. |
+| SQL | Type any SQL query against the attendance database (read-only), with ready-made examples; download results. |
 
-Data is stored in **Google Cloud Firestore** — never in this repo. Until Firestore is connected the pages run on
-invented demo names. Setup steps are in the app under *Members → Setup* (service account key + `attendance_password`
-in Streamlit **Secrets**). CSV files and keys are blocked by `.gitignore`; don't commit them — this repo is public.
+Data is stored in a **Postgres** database (Supabase or Neon) — never in this repo. Until `database_url` is set in the
+app's Streamlit **Secrets**, the pages run on a SQLite demo database with invented names. Setup steps are in the app
+under *Members → Setup*. Tables: `members`, `services`, `attendance` — query them from the SQL page, Supabase's SQL
+editor, or Python (`pandas.read_sql`). CSV files and connection strings are blocked by `.gitignore`; don't commit them —
+this repo is public.
 
 ## What's inside
 
