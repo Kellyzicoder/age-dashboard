@@ -97,7 +97,11 @@ def get_data():
         from generate_data import generate
         churches, members = generate()
     snap = build_snapshots(churches, members)
-    return churches, snap, len(members)
+    cids = snap.church_id.to_numpy()
+    starts = np.searchsorted(cids, churches.church_id.to_numpy(), side="left")
+    ends = np.searchsorted(cids, churches.church_id.to_numpy(), side="right")
+    bounds = dict(zip(churches.church_id, zip(starts, ends)))  # church_id -> (start, end) row slice
+    return churches, snap, len(members), bounds
 
 
 def build_snapshots(churches: pd.DataFrame, members: pd.DataFrame) -> pd.DataFrame:
@@ -118,6 +122,7 @@ def build_snapshots(churches: pd.DataFrame, members: pd.DataFrame) -> pd.DataFra
         nz = np.flatnonzero(cnt)
         out.append(pd.DataFrame({"c": nz // (2 * n_a), "g": (nz // n_a) % 2, "age": nz % n_a, "n": cnt[nz], "year": y}))
     snap = pd.concat(out, ignore_index=True)
+    snap = snap.sort_values(["c", "year"], kind="stable", ignore_index=True)  # church-major: each church is one slice
     meta = churches.set_index("church_id")
     snap = pd.DataFrame({
         "church_id": ids[snap.c], "gender": np.where(snap.g == 1, "M", "F"),
@@ -140,7 +145,7 @@ def band_of(age: int) -> str:
     return BANDS[int(np.searchsorted(BAND_EDGES, age, side="left")) - 1]
 
 
-churches, snap, N_MEMBERS = get_data()
+churches, snap, N_MEMBERS, CHURCH_ROWS = get_data()
 YEARS = sorted(snap.year.unique())
 
 # ---------- shared sidebar filters ----------
@@ -335,21 +340,31 @@ def page_live():
     st.fragment(live_body, run_every=every if on else None)()
 
 
+@st.cache_resource(max_entries=64, show_spinner=False)
+def compare_data(key, dim):
+    f = filtered(*key)["f"]
+    first, last = int(f.year.min()), int(f.year.max())
+    md = median_by(f, ["year", dim])
+    t = f.groupby(["year", dim]).n.sum().reset_index()
+    base = t[t.year == first].set_index(dim).n
+    t["index"] = t.n / t[dim].map(base) * 100
+    hb = f[f.year.isin([first, last])].groupby([dim, "band", "year"], observed=True).n.sum().unstack("year")
+    hb = ((hb[last] / hb[first] - 1) * 100).unstack("band").reindex(columns=BANDS)
+    return md, t, hb
+
+
 def page_compare():
     hero("Compare groups", "Median age and membership growth side by side")
     dim = st.segmented_control("Compare by", ["region", "denomination", "setting"], default="denomination",
                                format_func=str.title) or "denomination"
     cmap = {g: SERIES[i % len(SERIES)] for i, g in enumerate(sorted(churches[dim].unique()))}
+    md, t, hb = compare_data(FILTER_KEY, dim)
     c1, c2 = st.columns(2)
-    md = median_by(f, ["year", dim])
     fig = px.line(md, x="year", y="median_age", color=dim, color_discrete_map=cmap, markers=True,
                   labels={"median_age": "Median age", "year": "", dim: ""})
     fig.update_traces(line_width=2, marker_size=7)
     card(c1, style(fig, 420, "Median age over time"))
 
-    t = f.groupby(["year", dim]).n.sum().reset_index()
-    base = t[t.year == first].set_index(dim).n
-    t["index"] = t.apply(lambda r: r.n / base[r[dim]] * 100, axis=1)
     fig = px.line(t, x="year", y="index", color=dim, color_discrete_map=cmap, markers=True,
                   labels={"index": f"Members (index, {first}=100)", "year": "", dim: ""})
     fig.update_traces(line_width=2, marker_size=7)
@@ -357,8 +372,6 @@ def page_compare():
     card(c2, style(fig, 420, "Membership growth (indexed)"))
 
     # heatmap: growth % by group × age band (diverging red <-> blue, neutral midpoint)
-    hb = f[f.year.isin([first, last])].groupby([dim, "band", "year"], observed=True).n.sum().unstack("year")
-    hb = ((hb[last] / hb[first] - 1) * 100).unstack("band").reindex(columns=BANDS)
     lim = float(np.nanpercentile(np.abs(hb.values), 95)) or 1
     fig = px.imshow(hb, text_auto=".0f", aspect="auto", zmin=-lim, zmax=lim,
                     color_continuous_scale=[[0, "#d03b3b"], [0.5, T["mid"]], [1, "#2a78d6"]],
@@ -367,14 +380,22 @@ def page_compare():
     card(st, style(fig, 360, f"Growth % by age group, {first}→{last}"))
 
 
+@st.cache_resource(max_entries=128, show_spinner=False)
+def pyramid_data(key, py):
+    R = filtered(*key)
+    sg, first = R["snap_geo"], int(R["f"].year.min())
+    p = sg[sg.year.isin([py, first])]
+    p = p.assign(age5=(p.age // 5 * 5).clip(upper=85))
+    cur = p[p.year == py].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
+    ref = p[p.year == first].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
+    return cur, ref
+
+
 def page_pyramid():
     hero("Age pyramid", "Male and female members by 5-year age group")
     py = st.select_slider("Year", options=list(range(first, last + 1)), value=last)
-    p = snap_geo[snap_geo.year.isin([py, first])].copy()
-    p["age5"] = (p.age // 5 * 5).clip(upper=85)
+    cur, ref = pyramid_data(FILTER_KEY, py)
     lab = lambda a: "85+" if a == 85 else f"{a}–{a+4}"
-    cur = p[p.year == py].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
-    ref = p[p.year == first].groupby(["age5", "gender"]).n.sum().unstack(fill_value=0)
     ylab = [lab(a) for a in cur.index]
     fig = go.Figure()
     fig.add_bar(y=ylab, x=-cur.get("M", 0), orientation="h", name=f"Male {py}", marker_color=SERIES[0],
@@ -456,7 +477,9 @@ def page_profile():
     cid = st.selectbox("Choose a church", opts.index, format_func=lambda i: f"{opts[i]} ({i})")
     info = churches.set_index("church_id").loc[cid]
     hero(opts[cid], f"{info.denomination} · {info.region} · {info.setting} · founded {info.founded}")
-    one = snap[(snap.church_id == cid) & snap.year.between(*yr)]
+    s0, s1 = CHURCH_ROWS[cid]
+    one = snap.iloc[s0:s1]
+    one = one[one.year.between(*yr)]
     ob = one.groupby(["year", "band"], observed=True).n.sum().reset_index()
     c1, c2 = st.columns(2)
     fig = px.bar(ob, x="year", y="n", color="band", category_orders={"band": BANDS}, color_discrete_map=BAND_MAP,
