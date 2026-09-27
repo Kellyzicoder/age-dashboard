@@ -24,6 +24,7 @@ import plotly.express as px
 import streamlit as st
 
 TZ = ZoneInfo("Pacific/Auckland")
+BRAND = dict(navy="#2c4b77", teal="#208088", green="#2aa686", slate="#293641", gold="#ffcf00")  # from the FCC logo
 YELLOW_AT, RED_AT = 3, 5          # services missed in a row
 INACTIVE = {"inactive", "moved", "left", "deceased", "transferred"}
 AMBER, CRIMSON = "#fab219", "#d03b3b"   # reserved status colours (always shown with icon + label)
@@ -377,11 +378,27 @@ def parse_registers(register: pd.DataFrame | None, first_timers: pd.DataFrame | 
 
 
 # ---------------------------------------------------------------- page helpers
+@st.cache_data(show_spinner=False)
+def logo_img(css_class: str = "hero-logo") -> str:
+    """The church logo as an inline <img> (empty string if the file is missing)."""
+    import base64
+    from pathlib import Path
+    p = Path(__file__).parent / "static" / "logo.png"
+    if not p.exists():
+        return ""
+    return f'<img class="{css_class}" alt="Favourite Child Church" src="data:image/png;base64,{base64.b64encode(p.read_bytes()).decode()}">'
+
+
+def hero_html(eyebrow: str, title: str, subtitle: str, chips: list[str], live: bool = False) -> str:
+    dot = '<span class="live-dot"></span>' if live else ""
+    return (f'<div class="hero">{logo_img()}<div class="hero-text"><div class="eyebrow">{eyebrow}</div>'
+            f'<h1>{dot}{title}</h1><p>{subtitle}</p>' + "".join(f'<span class="chip">{c}</span>' for c in chips)
+            + "</div></div>")
+
+
 def header(title: str, subtitle: str, store, live: bool = False):
     badge = "Demo data (invented names · SQLite)" if store.demo else "Connected · Postgres database"
-    dot = '<span class="live-dot"></span>' if live else ""
-    st.html(f'<div class="hero"><div class="eyebrow">⛪ Attendance</div><h1>{dot}{title}</h1><p>{subtitle}</p>'
-            f'<span class="chip">{badge}</span></div>')
+    st.html(hero_html("Favourite Child Church · Attendance", title, subtitle, [badge], live))
 
 
 def gate(store) -> bool:
@@ -407,6 +424,16 @@ def gate(store) -> bool:
     return False
 
 
+def layout_prefs(names: bool = False):
+    """Sidebar layout controls. Streamlit can't drag-resize panels, so layout is chosen here instead."""
+    with st.sidebar:
+        st.markdown("**Layout**")
+        mode = st.segmented_control("Panels", ["Side by side", "Stacked"], default="Side by side",
+                                    key="lay_mode") or "Side by side"
+        per_row = st.select_slider("Names per row", options=[1, 2, 3, 4], value=3, key="lay_names") if names else 3
+    return mode, per_row
+
+
 def demo_note(store):
     if store.demo:
         st.info("These pages are showing **invented demo people**. Connect your Postgres database (see *Members → Setup*) "
@@ -420,6 +447,7 @@ def page_checkin():
     if not gate(store):
         return
     demo_note(store)
+    _, per_row = layout_prefs(names=True)
     c1, c2, c3 = st.columns([1, 2, 2], vertical_alignment="bottom")
     day = c1.date_input("Service date", value=today(), format="DD/MM/YYYY")
     svc_name = c2.text_input("Service", value="Sunday Service")
@@ -444,12 +472,12 @@ def page_checkin():
                     border=True)
         with st.container(border=True):
             st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · showing {len(shown)} of {len(members)}")
-            cols = st.columns(3)
+            cols = st.columns(per_row)
             for i, m in enumerate(shown):
                 key = f"ci_{date}_{m['id']}"
                 st.session_state[key] = m["id"] in present  # sync ticks made on other devices
                 tag = " · first-timer" if m.get("type") == "first_timer" else ""
-                cols[i % 3].checkbox(f"{m['full_name']}{tag}", key=key, on_change=on_tick, args=(m["id"],))
+                cols[i % per_row].checkbox(f"{m['full_name']}{tag}", key=key, on_change=on_tick, args=(m["id"],))
 
     live_list()
 
@@ -522,7 +550,7 @@ def page_followup():
         trend = pd.DataFrame([dict(date=s["date"], present=len(s.get("present") or {})) for s in past[-26:]])
         trend["date"] = pd.to_datetime(trend.date)
         fig = px.bar(trend, x="date", y="present", labels={"present": "People present", "date": ""})
-        fig.update_traces(marker_color="#2a78d6", hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
+        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
         fig.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10), bargap=0.25,
                           title=dict(text="Attendance per service", font=dict(size=15)))
         with st.container(border=True):
@@ -683,12 +711,13 @@ def page_sql():
     if not gate(store):
         return
     demo_note(store)
-    left, right = st.columns([1, 3])
+    mode, _ = layout_prefs()
+    left, right = (st.container(), st.container()) if mode == "Stacked" else st.columns([2, 5])
     with left.container(border=True):
         st.markdown("**Tables**")
-        st.code("members\n  id, full_name, phone, email,\n  group_name, role, status, type,\n  date_joined, first_visit,\n"
+        st.code("members\n  id, full_name, phone,\n  email, group_name, role,\n  status, type,\n  date_joined, first_visit,\n"
                 "  invited_by, follow_up\n\nservices\n  service_date, name\n\nattendance\n"
-                "  service_date, member_id,\n  checked_at", language=None)
+                "  service_date,\n  member_id, checked_at", language=None)
         pick = st.selectbox("Example queries", list(EXAMPLES), index=None, placeholder="Pick an example…")
         if pick and st.session_state.get("sql_pick") != pick:
             st.session_state.sql_pick = pick

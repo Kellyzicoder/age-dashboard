@@ -17,7 +17,11 @@ import plotly.express as px
 import plotly.graph_objects as go
 import streamlit as st
 
-st.set_page_config(page_title="Age Dashboard", page_icon="⛪", layout="wide", initial_sidebar_state="expanded")
+LOGO = Path(__file__).parent / "static" / "logo.png"
+st.set_page_config(page_title="FCC Dashboard", page_icon=str(LOGO) if LOGO.exists() else "⛪", layout="wide",
+                   initial_sidebar_state="expanded")
+if LOGO.exists():
+    st.logo(str(LOGO), size="large")
 
 DATA = Path(__file__).parent / "data"
 TZ = ZoneInfo("Pacific/Auckland")
@@ -46,17 +50,20 @@ html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSideb
 [data-testid="stMetric"] {{box-shadow: 0 1px 2px rgba(0,0,0,.05);}}
 [data-testid="stMetricLabel"] p {{font-size: .82rem; opacity: .8; font-weight: 500;}}
 [data-testid="stMetricValue"] {{font-weight: 700; letter-spacing: -.02em;}}
-.hero {{background: linear-gradient(120deg, #0d366b 0%, #1c5cab 55%, #2a78d6 100%); color: #fff;
-        border-radius: 1rem; padding: 1.4rem 1.8rem; margin-bottom: .4rem;}}
-.hero .eyebrow {{font-size: .78rem; font-weight: 600; letter-spacing: .08em; text-transform: uppercase; opacity: .75;}}
+.hero {{background: linear-gradient(120deg, #2c4b77 0%, #208088 55%, #2aa686 100%); color: #fff;
+        border-radius: 1rem; padding: 1.3rem 1.8rem; margin-bottom: .4rem; display: flex; gap: 1.3rem; align-items: center;}}
+.hero .hero-logo {{width: 64px; height: auto; flex: none; filter: drop-shadow(0 2px 6px rgba(0,0,0,.3));}}
+.hero .hero-text {{min-width: 0;}}
+.hero .eyebrow {{font-size: .78rem; font-weight: 700; letter-spacing: .08em; text-transform: uppercase; color: #ffcf00;}}
+@media (max-width: 640px) {{ .hero {{padding: 1.1rem 1.1rem; gap: .9rem;}} .hero .hero-logo {{width: 44px;}} }}
 .hero h1 {{font-size: 1.9rem; font-weight: 800; margin: .1rem 0 0; letter-spacing: -.02em; color: #fff; padding: 0;}}
 .hero p {{margin: .35rem 0 .9rem; opacity: .88; font-size: .98rem;}}
 .chip {{display: inline-block; background: rgba(255,255,255,.16); border: 1px solid rgba(255,255,255,.28);
         border-radius: 999px; padding: .2rem .7rem; margin: 0 .35rem .35rem 0; font-size: .8rem; font-weight: 500;}}
-.live-dot {{display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; background: #0ca30c;
+.live-dot {{display: inline-block; width: .55rem; height: .55rem; border-radius: 50%; background: #ffcf00;
             margin-right: .45rem; animation: pulse 1.6s infinite;}}
-@keyframes pulse {{0% {{box-shadow: 0 0 0 0 rgba(12,163,12,.6);}} 70% {{box-shadow: 0 0 0 .5rem rgba(12,163,12,0);}}
-                   100% {{box-shadow: 0 0 0 0 rgba(12,163,12,0);}}}}
+@keyframes pulse {{0% {{box-shadow: 0 0 0 0 rgba(255,207,0,.6);}} 70% {{box-shadow: 0 0 0 .5rem rgba(255,207,0,0);}}
+                   100% {{box-shadow: 0 0 0 0 rgba(255,207,0,0);}}}}
 </style>
 """)
 
@@ -230,10 +237,7 @@ def hero(page_title: str, subtitle: str, live: bool = False):
              chip_label(denoms, churches.denomination.unique(), "All denominations"),
              chip_label(settings, churches.setting.unique(), "Urban, peri-urban & rural"),
              {"All": "All genders", "F": "Female", "M": "Male"}[gender]]
-    dot = '<span class="live-dot"></span>' if live else ""
-    st.html(
-        f'<div class="hero"><div class="eyebrow">⛪ Age Dashboard</div><h1>{dot}{page_title}</h1><p>{subtitle}</p>'
-        + "".join(f'<span class="chip">{c}</span>' for c in chips) + "</div>")
+    st.html(attendance.hero_html("Favourite Child Church · Age dashboard", page_title, subtitle, chips, live))
 
 
 # ---------- pages ----------
