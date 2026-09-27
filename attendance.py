@@ -1,4 +1,4 @@
-"""Attendance: live check-in, missed-service follow-up, member register and a SQL query page.
+"""FCC Attendance Tracker: live check-in, live arrivals, follow-up, insights, member register and SQL.
 
 Storage is a plain SQL database, so you can query it directly:
   • Postgres (Supabase or Neon) when `database_url` is set in Streamlit secrets — the real data;
@@ -618,6 +618,172 @@ def page_members():
 
     with tab_setup:
         st.markdown(SETUP_GUIDE)
+
+
+def _parse_times(values) -> pd.Series:
+    t = pd.to_datetime(pd.Series(list(values), dtype="object"), errors="coerce", utc=True)
+    return t.dt.tz_convert(TZ)
+
+
+def _plot(fig, height=320, title=None):
+    fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 10, b=10),
+                      title=dict(text=title, font=dict(size=15)) if title else None,
+                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, title=None))
+    with st.container(border=True):
+        st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
+
+
+def page_live():
+    store = get_store()
+    header("Live", "Who has arrived — updates on its own every few seconds, great on a screen during service",
+           store, live=True)
+    if not gate(store):
+        return
+    demo_note(store)
+    c1, c2 = st.columns([1, 3], vertical_alignment="bottom")
+    day = c1.date_input("Service date", value=today(), format="DD/MM/YYYY", key="live_day")
+    every = c2.select_slider("Refresh every", options=[3, 5, 10, 30], value=5, format_func=lambda s: f"{s}s")
+    date = day.isoformat()
+
+    @st.fragment(run_every=every)
+    def live_body():
+        members = {m["id"]: m for m in store.list_members()}
+        s = store.get_service(date) or {}
+        present = s.get("present") or {}
+        past = sorted([x for x in store.list_services() if x.get("date", "") < date], key=lambda x: x["date"])
+        prev = past[-1] if past else None
+        prev_n = len(prev.get("present") or {}) if prev else None
+        ft_today = [mid for mid in present if members.get(mid, {}).get("type") == "first_timer"]
+        new_today = [mid for mid in present if members.get(mid, {}).get("first_visit") == date]
+        active = [m for m in members.values() if norm(m.get("status", "")) not in INACTIVE]
+
+        k = st.columns(4)
+        k[0].metric("Checked in", len(present),
+                    f"{len(present) - prev_n:+d} vs {dt.date.fromisoformat(prev['date']):%d %b}" if prev else None,
+                    border=True)
+        k[1].metric("First-timers here", len(ft_today), f"{len(new_today)} first visit today" if new_today else None,
+                    delta_color="off", border=True)
+        k[2].metric("Of the register", f"{len(present) / max(len(active), 1):.0%}", f"{len(active)} people",
+                    delta_color="off", border=True)
+        k[3].metric("Last service", prev_n if prev else "–",
+                    dt.date.fromisoformat(prev["date"]).strftime("%a %d %b") if prev else None,
+                    delta_color="off", border=True)
+
+        if not present:
+            st.info(f"No one is checked in for {day:%A %d %B} yet. Ticks on the **Check-in** page appear here "
+                    "within seconds.", icon=":material/hourglass_top:")
+        else:
+            ev = pd.DataFrame([dict(id=mid, name=members.get(mid, {}).get("full_name", "(removed)"),
+                                    type=members.get(mid, {}).get("type", "member"), at=at)
+                               for mid, at in present.items()])
+            ev["time"] = _parse_times(ev["at"]).set_axis(ev.index)  # keep NZ time zone
+            ev = ev.sort_values("time")
+            c1, c2 = st.columns([3, 2])
+            with c1:
+                arr = ev.dropna(subset=["time"]).assign(n=1)
+                if len(arr):
+                    arr["arrived"] = arr["n"].cumsum()
+                    fig = px.line(arr, x="time", y="arrived", line_shape="hv", markers=True,
+                                  labels={"arrived": "Checked in", "time": ""})
+                    fig.update_traces(line=dict(width=2, color=BRAND["teal"]), marker=dict(size=6),
+                                      hovertemplate="%{x|%H:%M}: %{y} checked in<extra></extra>")
+                    _plot(fig, 330, "Arrivals so far")
+            with c2.container(border=True):
+                st.markdown("**Latest arrivals**")
+                latest = ev.sort_values("time", ascending=False).head(12)
+                st.dataframe(pd.DataFrame({
+                    "Time": latest["time"].dt.strftime("%H:%M").fillna(""),
+                    "Name": latest["name"],
+                    "": latest["type"].map({"first_timer": "✨ First-timer"}).fillna("")}),
+                    hide_index=True, width="stretch", height=min(38 * (len(latest) + 1) + 4, 480))
+        st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · refreshing every {every}s")
+
+    live_body()
+
+
+def page_insights():
+    store = get_store()
+    header("Insights", "How attendance is trending — services, first-timers and groups", store)
+    if not gate(store):
+        return
+    demo_note(store)
+    members, services = store.list_members(), store.list_services()
+    mem = {m["id"]: m for m in members}
+    past = sorted([s for s in services if s.get("date", "") <= today().isoformat()], key=lambda s: s["date"])
+    if not past:
+        st.info("No services recorded yet. After a few Sundays of ticking on **Check-in**, trends appear here.")
+        return
+
+    rows = []
+    for s in past:
+        p = s.get("present") or {}
+        rows.append(dict(date=pd.to_datetime(s["date"]), present=len(p),
+                         first_timers=sum(1 for mid in p if mem.get(mid, {}).get("type") == "first_timer")))
+    per = pd.DataFrame(rows)
+    per["members"] = per.present - per.first_timers
+    per["avg4"] = per.present.rolling(4, min_periods=1).mean()
+    last, prev = per.iloc[-1], (per.iloc[-2] if len(per) > 1 else None)
+    recent_ids = set().union(*[set((s.get("present") or {}).keys()) for s in past[-4:]])
+
+    k = st.columns(4)
+    k[0].metric("Services recorded", len(per), border=True)
+    k[1].metric("Last service", int(last.present),
+                f"{int(last.present - prev.present):+d} vs previous" if prev is not None else None, border=True)
+    k[2].metric("Average (last 4)", f"{per.present.tail(4).mean():.0f}", border=True)
+    k[3].metric("Active people", len(recent_ids), "came at least once in the last 4 services",
+                delta_color="off", border=True)
+
+    long = per.melt(id_vars="date", value_vars=["members", "first_timers"], var_name="who", value_name="n")
+    long["who"] = long.who.map({"members": "Members", "first_timers": "First-timers"})
+    fig = px.bar(long, x="date", y="n", color="who", barmode="stack",
+                 color_discrete_map={"Members": BRAND["teal"], "First-timers": BRAND["navy"]},
+                 category_orders={"who": ["Members", "First-timers"]}, labels={"n": "People", "date": ""})
+    fig.update_traces(marker_line_width=0, hovertemplate="%{x|%d %b %Y}: %{y}<extra>%{fullData.name}</extra>")
+    fig.add_scatter(x=per.date, y=per.avg4, mode="lines", name="4-service average",
+                    line=dict(color=BRAND["slate"], width=2, dash="dot"), hovertemplate="%{y:.1f}<extra>4-service avg</extra>")
+    fig.update_layout(bargap=0.25, hovermode="x unified")
+    _plot(fig, 360, "Attendance per service")
+
+    c1, c2 = st.columns(2)
+    with c1:
+        ft = pd.DataFrame([m for m in members if m.get("first_visit")])
+        if ft.empty:
+            with st.container(border=True):
+                st.markdown("**First-timers per month**")
+                st.caption("No first-visit dates yet.")
+        else:
+            ft["month"] = pd.to_datetime(ft.first_visit).dt.to_period("M").dt.to_timestamp()
+            by_m = ft.groupby("month").size().rename("n").reset_index()
+            fig = px.bar(by_m, x="month", y="n", labels={"n": "First-timers", "month": ""})
+            fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%b %Y}: %{y}<extra></extra>")
+            fig.update_layout(bargap=0.3)
+            _plot(fig, 300, "First-timers per month")
+    with c2:
+        fts = [m for m in members if m.get("type") == "first_timer" or m.get("first_visit")]
+        came_back = 0
+        for m in fts:
+            dates = sorted(s["date"] for s in past if m["id"] in (s.get("present") or {}))
+            first = m.get("first_visit") or (dates[0] if dates else None)
+            if first and any(d > first for d in dates):
+                came_back += 1
+        with st.container(border=True):
+            st.markdown("**Did first-timers come back?**")
+            a, b = st.columns(2)
+            a.metric("First-timers", len(fts))
+            b.metric("Came back at least once", came_back,
+                     f"{came_back / len(fts):.0%}" if fts else None, delta_color="off")
+            st.caption("Counts anyone with a first-visit date or marked first-timer who was ticked at a later service.")
+
+    grp = {}
+    for s in past[-8:]:
+        for mid in (s.get("present") or {}):
+            g = (mem.get(mid, {}).get("group") or "").strip() or "(no group)"
+            grp[g] = grp.get(g, 0) + 1
+    if grp:
+        gdf = pd.DataFrame({"group": list(grp), "avg": [v / len(past[-8:]) for v in grp.values()]}).sort_values("avg")
+        fig = px.bar(gdf, x="avg", y="group", orientation="h", labels={"avg": "Average per service", "group": ""})
+        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
+        _plot(fig, max(220, 36 * len(gdf) + 90), f"Attendance by group (last {len(past[-8:])} services)")
 
 
 SETUP_GUIDE = """
