@@ -61,6 +61,13 @@ SCHEMA = [
         checked_at TEXT, PRIMARY KEY (service_date, member_id))""",
     "CREATE INDEX IF NOT EXISTS attendance_member ON attendance(member_id)",
 ]
+# Sign-ups from the public welcome form. On Postgres this table is created by the setup SQL (Members → Setup),
+# because it needs Row Level Security and a UUID default; here it only exists for the SQLite demo.
+DEMO_REGISTRATIONS = """CREATE TABLE IF NOT EXISTS registrations (
+    id TEXT PRIMARY KEY, full_name TEXT, phone TEXT, email TEXT, invited_by TEXT, first_visit DATE, notes TEXT,
+    wants_contact BOOLEAN DEFAULT TRUE, status TEXT DEFAULT 'pending', created_at TEXT, member_id TEXT)"""
+REG_COLS = ["full_name", "phone", "email", "invited_by", "first_visit", "notes", "wants_contact", "status",
+            "created_at", "member_id"]
 
 
 def _txt(v) -> str:
@@ -115,7 +122,7 @@ class SqlStore:
 
     def _ensure_schema(self):
         if not self._schema_ready:
-            for stmt in SCHEMA:
+            for stmt in SCHEMA + ([DEMO_REGISTRATIONS] if self.demo else []):
                 self._raw(stmt)
             self._schema_ready = True
 
@@ -286,6 +293,53 @@ class SqlStore:
         self._cache.pop("members", None)
         return n
 
+    # -- sign-ups from the welcome form
+    def list_registrations(self, status: str = "pending") -> list[dict] | None:
+        """Sign-ups with this status, oldest first. None if the registrations table isn't set up yet."""
+        cols = ", ".join(["id"] + REG_COLS)
+        try:
+            rows = self._exec(f"SELECT {cols} FROM registrations WHERE status = ? ORDER BY created_at", (status,),
+                              fetch=True)
+        except DbUnavailable:
+            raise
+        except Exception as e:  # table or a column missing → the setup SQL hasn't been run
+            self.last_setup_error = str(e).strip().splitlines()[0][:300]
+            return None
+        out = []
+        for r in rows:
+            d = {k: _txt(v) for k, v in r.items()}
+            d["wants_contact"] = bool(r.get("wants_contact")) if r.get("wants_contact") is not None else True
+            out.append(d)
+        return out
+
+    def count_pending(self) -> int:
+        regs = self._cached("pending", 30, lambda: self.list_registrations("pending"))
+        return len(regs or [])
+
+    def resolve_registration(self, reg_id: str, status: str, member_id: str | None = None):
+        self._exec("UPDATE registrations SET status = ?, member_id = ? WHERE CAST(id AS TEXT) = ?",
+                   (status, member_id, str(reg_id)))
+        self._cache.pop("pending", None)
+
+    def approve_registration(self, reg: dict, match_id: str | None = None, check_in: bool = True) -> str:
+        """Add the sign-up to the register (or fill gaps on the matched person), optionally tick them present."""
+        visit = reg.get("first_visit") or today().isoformat()
+        fields = dict(full_name=" ".join(reg["full_name"].split()), phone=reg.get("phone", "").strip(),
+                      email=reg.get("email", "").strip(), invited_by=reg.get("invited_by", "").strip())
+        if match_id:  # existing person: only fill in what the form provided, never blank anything
+            self.upsert_members([dict(id=match_id, **{k: v for k, v in fields.items() if v and k != "full_name"})])
+            mid = match_id
+        else:
+            mid = new_id()
+            note = reg.get("notes", "").strip()
+            follow = "Welcome form" + ("" if reg.get("wants_contact", True) else " · prefers no contact")
+            self.upsert_members([dict(id=mid, **fields, type="first_timer", status="", first_visit=visit,
+                                      follow_up=follow + (f" · {note}" if note else ""), created_at=now_iso())])
+        if check_in:
+            self.set_present(visit, mid, True)
+        self.resolve_registration(reg["id"], "approved", mid)
+        return mid
+
     # -- read-only SQL for the query page
     def run_query(self, sql: str, limit: int = 5000) -> pd.DataFrame:
         sql = sql.strip().rstrip(";").strip()
@@ -320,6 +374,7 @@ class SqlStore:
         return pd.DataFrame(rows, columns=cols)
 
     readonly_url = None
+    last_setup_error = ""
 
 
 def _seed_demo(store: "SqlStore"):
@@ -349,6 +404,12 @@ def _seed_demo(store: "SqlStore"):
                 att.append((d.isoformat(), m, dt.datetime.combine(d, dt.time(10, int(rng.integers(0, 40))), TZ).isoformat()))
     store._exec("INSERT INTO services (service_date, name) VALUES (?, ?)", svc, many=True)
     store._exec("INSERT INTO attendance (service_date, member_id, checked_at) VALUES (?, ?, ?)", att, many=True)
+    regs = [("Grace Mensah", "022 481 2290", "", "Esi Boateng", "Loved the worship — would like to join the choir", True),
+            ("Daniel Owusu", "", "daniel.o@example.com", "Instagram", "", False)]
+    store._exec("INSERT INTO registrations (id, full_name, phone, email, invited_by, first_visit, notes, wants_contact, "
+                "status, created_at) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'pending', ?)",
+                [(new_id(), n, ph, em, inv, sundays[-1].isoformat(), note, wc, now_iso()) for n, ph, em, inv, note, wc in regs],
+                many=True)
 
 
 @st.cache_resource(show_spinner="Connecting to the database…")
@@ -765,10 +826,15 @@ def page_members():
     if not gate(store):
         return
     demo_note(store)
-    tab_list, tab_add, tab_import, tab_setup = st.tabs(["Register", "Add person", "Import CSV", "Setup"])
+    pending = store.count_pending()
+    tab_list, tab_signups, tab_add, tab_import, tab_setup = st.tabs(
+        ["Register", f"Sign-ups ({pending})" if pending else "Sign-ups", "Add person", "Import CSV", "Setup"])
 
     with tab_list:
         register_editor(store)
+
+    with tab_signups:
+        signups(store)
 
     with tab_add:
         with st.form("member_add", clear_on_submit=True):
@@ -807,6 +873,49 @@ def page_members():
 
     with tab_setup:
         st.markdown(SETUP_GUIDE)
+
+
+def signups(store):
+    """Approve or reject sign-ups that came in from the public welcome form."""
+    regs = store.list_registrations("pending")
+    if regs is None:
+        st.warning("The sign-ups table isn't set up yet (or is missing a column). Open Supabase → **SQL editor**, "
+                   "paste the SQL below and click **Run**.", icon=":material/construction:")
+        if store.last_setup_error:
+            st.caption(f"Database said: {store.last_setup_error}")
+        st.code(REGISTRATIONS_SQL, language="sql")
+        return
+    st.caption("People who filled in the welcome form. **Approve** adds them to the register as a first-timer "
+               "(or updates the person with the same name) — nothing reaches the register until you do.")
+    if not regs:
+        st.success("No sign-ups waiting.", icon=":material/done_all:")
+        return
+    by_name = {norm(m["full_name"]): m for m in store.list_members()}
+    for r in regs:
+        match = by_name.get(norm(r["full_name"]))
+        with st.container(border=True):
+            top = st.columns([3, 2], vertical_alignment="center")
+            submitted = _parse_times([r["created_at"]]).iloc[0]
+            top[0].markdown(f"**{r['full_name']}**" + (" · :orange[prefers no contact]" if not r["wants_contact"] else ""))
+            top[1].caption(f"Sent {submitted:%a %d %b, %H:%M}" if pd.notna(submitted) else "")
+            info = [("Phone", r["phone"]), ("Email", r["email"]), ("Invited by / heard via", r["invited_by"]),
+                    ("First visit", r["first_visit"])]
+            st.markdown("  \n".join(f"{k}: {v}" for k, v in info if v) or "_No contact details given._")
+            if r["notes"]:
+                st.info(r["notes"], icon=":material/chat:")
+            if match:
+                st.caption(f":material/link: Already on the register as **{match['full_name']}** "
+                           f"({match.get('type', '').replace('_', '-') or 'member'}) — approving updates that person.")
+            a, b, c = st.columns([2, 1, 1], vertical_alignment="center")
+            tick = a.checkbox(f"Mark present on {r['first_visit'] or 'today'}", value=True, key=f"reg_ci_{r['id']}")
+            if b.button("Approve", key=f"reg_ok_{r['id']}", type="primary", icon=":material/check:", width="stretch"):
+                store.approve_registration(r, match["id"] if match else None, check_in=tick)
+                st.toast(f"{r['full_name']} added to the register.", icon=":material/person_add:")
+                st.rerun()
+            if c.button("Reject", key=f"reg_no_{r['id']}", icon=":material/close:", width="stretch"):
+                store.resolve_registration(r["id"], "rejected")
+                st.toast(f"Sign-up from {r['full_name']} rejected.")
+                st.rerun()
 
 
 def _parse_times(values) -> pd.Series:
@@ -978,6 +1087,33 @@ def page_insights():
         _plot(fig, max(220, 36 * len(gdf) + 90), f"Attendance by group (last {len(past[-8:])} services)")
 
 
+REGISTRATIONS_SQL = """-- Sign-ups from the FCC welcome form. Safe to run more than once.
+create table if not exists registrations (
+  id uuid primary key default gen_random_uuid(),
+  created_at timestamptz not null default now()
+);
+alter table registrations
+  add column if not exists full_name     text,
+  add column if not exists phone         text,
+  add column if not exists email         text,
+  add column if not exists invited_by    text,
+  add column if not exists first_visit   date,
+  add column if not exists notes         text,
+  add column if not exists wants_contact boolean default true,
+  add column if not exists status        text default 'pending',
+  add column if not exists member_id     text,
+  add column if not exists created_at    timestamptz default now();
+
+alter table registrations enable row level security;
+
+-- The public form can only ADD pending sign-ups. It can't read, change or delete anything.
+drop policy if exists "form can submit" on registrations;
+create policy "form can submit" on registrations
+  for insert to anon
+  with check (status = 'pending' and length(trim(full_name)) between 2 and 120);
+grant insert on registrations to anon;"""
+
+
 SETUP_GUIDE = """
 **Connect a Postgres database** — Supabase (recommended: login, table editor, SQL editor) or Neon. Both have free plans.
 
@@ -1011,6 +1147,9 @@ import pandas as pd, psycopg
 with psycopg.connect("postgresql://…") as conn:
     df = pd.read_sql("SELECT * FROM attendance", conn)
 ```
+
+**Welcome form sign-ups** — run the SQL in *Members → Sign-ups* once in Supabase's SQL editor. It creates the
+`registrations` table the public form writes to, locked down so the form can only add new sign-ups.
 
 Never commit connection strings or your CSVs to GitHub — the repo is public. Both are blocked in `.gitignore`.
 """

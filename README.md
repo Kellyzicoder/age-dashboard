@@ -13,7 +13,7 @@ missing and follow up.
 | Follow-up | Priority list of who's been missing: 🟡 **yellow** = 3–4 services missed in a row, 🔴 **red** = 5+ in a row. Red first; download as CSV. |
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
-| Members | The register (members + first-timers), add people, and import the Google Sheets CSV exports. |
+| Members | The register (editable), sign-ups from the welcome form to approve, add people, and import the Google Sheets CSV exports. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |
 
 The sidebar has **Layout** controls (side-by-side or stacked panels, names per row on Check-in).
@@ -26,7 +26,7 @@ Stored in a **Postgres** database (Supabase) — never in this repo. Tables:
 - `members` — id, full_name, phone, email, group_name, role, status, type (member / first_timer), date_joined, first_visit, invited_by, follow_up
 - `services` — service_date, name
 - `attendance` — service_date, member_id, checked_at (one row per person ticked per service)
-- `registrations` — sign-ups from the public form (coming soon), waiting for approval
+- `registrations` — sign-ups from the [welcome form](https://github.com/Kellyzicoder/fcc-welcome), approved under *Members → Sign-ups*
 
 Until `database_url` is set in the app's Streamlit **Secrets**, the pages run on a SQLite demo database with invented
 names. Setup steps are in the app under *Members → Setup*. Query the data from the SQL page, Supabase's SQL editor,
