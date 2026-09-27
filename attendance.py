@@ -70,8 +70,29 @@ def _txt(v) -> str:
     return v.isoformat() if hasattr(v, "isoformat") else str(v)
 
 
+class DbUnavailable(Exception):
+    """The database can't be reached right now. Carries a plain-English reason for the page to show."""
+
+
+def _friendly(err: Exception) -> str:
+    msg = str(err).lower()
+    if "password authentication failed" in msg:
+        return ("The database refused the password. Check `database_url` in the app's Secrets — "
+                "it must contain the current Supabase database password.")
+    if "circuit" in msg or "too many" in msg or "max client" in msg:
+        return ("The database has paused logins for a moment after repeated failed attempts. "
+                "Wait a few minutes, check the password in Secrets, then try again.")
+    if "timeout" in msg or "timed out" in msg or "could not translate host" in msg or "resolve" in msg:
+        return "Couldn't reach the database server. It may be paused or the internet connection dropped."
+    return "The database isn't responding right now."
+
+
 class SqlStore:
-    """One store for both engines. Queries use standard SQL that runs unchanged on SQLite and Postgres."""
+    """One store for both engines. Queries use standard SQL that runs unchanged on SQLite and Postgres.
+
+    If Postgres can't be reached, the store backs off (30 s, doubling up to 5 min) and raises DbUnavailable
+    straight away during that time — so auto-refreshing pages don't hammer the server and get locked out.
+    """
 
     def __init__(self, url: str | None):
         self.demo = not url
@@ -81,15 +102,44 @@ class SqlStore:
         self._lock = threading.RLock()
         self._conn = None
         self._cache = {}
+        self._schema_ready = False
+        self._down_until = 0.0
+        self._backoff = 0.0
+        self.last_error = ""
         if self.demo:
             import os
             if os.path.exists(self.path):
                 os.remove(self.path)  # fresh demo on every app start
-        with self._lock:
-            for stmt in SCHEMA:
-                self._exec(stmt)
-        if self.demo:
+            self._ensure_schema()
             _seed_demo(self)
+
+    def _ensure_schema(self):
+        if not self._schema_ready:
+            for stmt in SCHEMA:
+                self._raw(stmt)
+            self._schema_ready = True
+
+    def retry_in(self) -> int:
+        """Seconds until the next connection attempt is allowed (0 = now)."""
+        return max(0, int(self._down_until - dt.datetime.now().timestamp()) + 1) if self._down_until else 0
+
+    def retry_now(self):
+        self._down_until = 0.0
+
+    def _mark_down(self, err: Exception):
+        self._backoff = min(max(self._backoff * 2, 30.0), 300.0)
+        self._down_until = dt.datetime.now().timestamp() + self._backoff
+        self.last_error = _friendly(err)
+        try:
+            if self._conn is not None:
+                self._conn.close()
+        except Exception:
+            pass
+        self._conn = None
+
+    def _check_up(self):
+        if self._down_until and dt.datetime.now().timestamp() < self._down_until:
+            raise DbUnavailable(self.last_error)
 
     # -- connection handling
     def _connect(self):
@@ -105,29 +155,47 @@ class SqlStore:
     def _q(self, sql: str) -> str:
         return sql if self.demo else sql.replace("?", "%s")
 
+    def _raw(self, sql, params=(), many=False, fetch=False):
+        if self._conn is None:
+            self._conn = self._connect()
+        cur = self._conn.cursor()
+        if many:
+            cur.executemany(self._q(sql), params)
+        else:
+            cur.execute(self._q(sql), params)
+        if fetch:
+            cols = [d[0] for d in cur.description]
+            return [dict(zip(cols, r)) for r in cur.fetchall()]
+        return None
+
     def _exec(self, sql, params=(), many=False, fetch=False):
+        if self.demo:
+            with self._lock:
+                return self._raw(sql, params, many, fetch)
+        import psycopg
         with self._lock:
-            for attempt in (1, 2):  # one reconnect if the server dropped the connection
+            self._check_up()
+            for attempt in (1, 2):  # one quiet reconnect if the server dropped an idle connection
                 try:
-                    if self._conn is None:
-                        self._conn = self._connect()
-                    cur = self._conn.cursor()
-                    if many:
-                        cur.executemany(self._q(sql), params)
-                    else:
-                        cur.execute(self._q(sql), params)
-                    if fetch:
-                        cols = [d[0] for d in cur.description]
-                        return [dict(zip(cols, r)) for r in cur.fetchall()]
-                    return None
-                except Exception:
-                    if attempt == 2 or self.demo:
-                        raise
+                    self._ensure_schema()
+                    out = self._raw(sql, params, many, fetch)
+                    self._backoff, self._down_until = 0.0, 0.0
+                    return out
+                except psycopg.OperationalError as e:  # connection-level problem (not a bad query)
+                    stale = self._conn is not None and attempt == 1  # an old connection went away: reconnect once
+                    if not stale:
+                        self._mark_down(e)
+                        raise DbUnavailable(self.last_error) from e
                     try:
                         self._conn.close()
                     except Exception:
                         pass
                     self._conn = None
+                except psycopg.InterfaceError as e:  # connection already closed
+                    self._conn = None
+                    if attempt == 2:
+                        self._mark_down(e)
+                        raise DbUnavailable(self.last_error) from e
 
     def _cached(self, key, ttl, fn):
         now = dt.datetime.now().timestamp()
@@ -235,7 +303,13 @@ class SqlStore:
             finally:
                 conn.close()
         import psycopg
-        with psycopg.connect(self.readonly_url or self.url, connect_timeout=10) as conn:
+        self._check_up()
+        try:
+            conn = psycopg.connect(self.readonly_url or self.url, connect_timeout=10)
+        except psycopg.OperationalError as e:
+            self._mark_down(e)
+            raise DbUnavailable(self.last_error) from e
+        with conn:
             with conn.cursor() as cur:
                 cur.execute("SET TRANSACTION READ ONLY")         # the database itself refuses any write
                 cur.execute("SET LOCAL statement_timeout = '15s'")
@@ -287,6 +361,33 @@ def get_store():
     store = SqlStore(url or None)
     store.readonly_url = ro or None
     return store
+
+
+def show_db_down(err: Exception, key: str = "page"):
+    """Friendly 'can't reach the database' panel instead of a traceback, with a manual retry."""
+    store = get_store()
+    wait = store.retry_in()
+    with st.container(border=True):
+        st.error(f"**Can't connect to the database.** {err}", icon=":material/cloud_off:")
+        st.caption("To avoid getting locked out, the app waits before trying again"
+                   + (f" (next automatic try in about {wait} s)." if wait else ".")
+                   + " Ticks and edits made while offline are not saved.")
+        if st.button("Try again now", icon=":material/refresh:", key=f"db_retry_{key}"):
+            store.retry_now()
+            st.rerun()
+
+
+def db_safe(fn):
+    """Wrap a page or live fragment so a database outage shows a message, not a crash."""
+    import functools
+
+    @functools.wraps(fn)
+    def run(*a, **k):
+        try:
+            return fn(*a, **k)
+        except DbUnavailable as e:
+            show_db_down(e, fn.__name__)
+    return run
 
 
 # ---------------------------------------------------------------- follow-up logic
@@ -457,6 +558,7 @@ def demo_note(store):
 
 
 # ---------------------------------------------------------------- pages
+@db_safe
 def page_checkin():
     store = get_store()
     header("Check-in", "Tick people as they arrive — every phone sees the same list within seconds", store, live=True)
@@ -474,9 +576,13 @@ def page_checkin():
     members = [m for m in members if norm(m.get("status", "")) not in INACTIVE]
 
     def on_tick(mid):
-        store.set_present(date, mid, bool(st.session_state[f"ci_{date}_{mid}"]), svc_name)
+        try:
+            store.set_present(date, mid, bool(st.session_state[f"ci_{date}_{mid}"]), svc_name)
+        except DbUnavailable:
+            st.toast("Not saved — can't reach the database right now.", icon=":material/cloud_off:")
 
     @st.fragment(run_every=5)
+    @db_safe
     def live_list():
         s = store.get_service(date) or {}
         present = s.get("present") or {}
@@ -514,6 +620,7 @@ def page_checkin():
                 st.rerun()
 
 
+@db_safe
 def page_followup():
     store = get_store()
     header("Follow-up", f"Who we haven't seen — {RED_AT}+ services missed in a row is red, "
@@ -525,6 +632,7 @@ def page_followup():
                                 default="Needs follow-up") or "Needs follow-up"
 
     @st.fragment(run_every=30)
+    @db_safe
     def live_followup():
         members, services = store.list_members(), store.list_services()
         df = missed_streaks(members, services)
@@ -650,6 +758,7 @@ def register_editor(store):
             st.rerun()
 
 
+@db_safe
 def page_members():
     store = get_store()
     header("Members", "Your register and first-timers, stored in the database", store)
@@ -713,6 +822,7 @@ def _plot(fig, height=320, title=None):
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
+@db_safe
 def page_live():
     store = get_store()
     header("Live", "Who has arrived — updates on its own every few seconds, great on a screen during service",
@@ -726,6 +836,7 @@ def page_live():
     date = day.isoformat()
 
     @st.fragment(run_every=every)
+    @db_safe
     def live_body():
         members = {m["id"]: m for m in store.list_members()}
         s = store.get_service(date) or {}
@@ -781,6 +892,7 @@ def page_live():
     live_body()
 
 
+@db_safe
 def page_insights():
     store = get_store()
     header("Insights", "How attendance is trending — services, first-timers and groups", store)
@@ -951,6 +1063,7 @@ ORDER BY first_timers DESC""",
 }
 
 
+@db_safe
 def page_sql():
     store = get_store()
     header("SQL", "Ask the database anything — read-only, so nothing can be changed from here", store)
