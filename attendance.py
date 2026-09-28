@@ -14,6 +14,7 @@ Tables (same in SQLite and Postgres):
 from __future__ import annotations
 
 import datetime as dt
+import re
 import threading
 import uuid
 from zoneinfo import ZoneInfo
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 TZ = ZoneInfo("Pacific/Auckland")
@@ -28,6 +30,10 @@ BRAND = dict(navy="#2c4b77", teal="#208088", green="#2aa686", slate="#293641", g
 YELLOW_AT, RED_AT = 3, 5          # services missed in a row
 INACTIVE = {"inactive", "moved", "left", "deceased", "transferred"}
 AMBER, CRIMSON = "#fab219", "#d03b3b"   # reserved status colours (always shown with icon + label)
+# Chart colours, validated for colour-blind separation and contrast on the dark surface (#141c22).
+SERIES = dict(members="#2aa686", first_timers="#5a8ef0")
+STATUS = dict(ok="#2aa686", yellow=AMBER, red=CRIMSON)
+INK = dict(primary="#e8eef2", secondary="#9fb0bd", muted="#6b7c89", grid="rgba(255,255,255,0.06)")
 
 
 def today() -> dt.date:
@@ -60,7 +66,13 @@ SCHEMA = [
         member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
         checked_at TEXT, PRIMARY KEY (service_date, member_id))""",
     "CREATE INDEX IF NOT EXISTS attendance_member ON attendance(member_id)",
+    "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
+    """CREATE TABLE IF NOT EXISTS email_log (
+        id TEXT PRIMARY KEY, kind TEXT, report_date DATE, sent_at TEXT, recipients TEXT, ok BOOLEAN, detail TEXT)""",
 ]
+# Postgres only: lock the app's tables so the public (publishable) key used by the welcome form can't read them.
+PG_SECURITY = [f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"
+               for t in ("members", "services", "attendance", "settings", "email_log")]
 # Sign-ups from the public welcome form. On Postgres this table is created by the setup SQL (Members → Setup),
 # because it needs Row Level Security and a UUID default; here it only exists for the SQLite demo.
 DEMO_REGISTRATIONS = """CREATE TABLE IF NOT EXISTS registrations (
@@ -124,6 +136,15 @@ class SqlStore:
         if not self._schema_ready:
             for stmt in SCHEMA + ([DEMO_REGISTRATIONS] if self.demo else []):
                 self._raw(stmt)
+            if not self.demo:
+                import psycopg
+                for stmt in PG_SECURITY:  # best effort: never block the app if the role can't alter a table
+                    try:
+                        self._raw(stmt)
+                    except psycopg.OperationalError:
+                        raise
+                    except Exception:
+                        pass
             self._schema_ready = True
 
     def retry_in(self) -> int:
@@ -339,6 +360,30 @@ class SqlStore:
             self.set_present(visit, mid, True)
         self.resolve_registration(reg["id"], "approved", mid)
         return mid
+
+    # -- settings & email log (daily report)
+    def get_setting(self, key: str, default: str = "") -> str:
+        rows = self._exec("SELECT value FROM settings WHERE key = ?", (key,), fetch=True)
+        return rows[0]["value"] if rows and rows[0]["value"] is not None else default
+
+    def set_setting(self, key: str, value: str):
+        self._exec("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                   (key, value))
+
+    def log_email(self, kind: str, report_date: str, recipients: list[str], ok: bool, detail: str = ""):
+        self._exec("INSERT INTO email_log (id, kind, report_date, sent_at, recipients, ok, detail) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id(), kind, report_date, now_iso(), ", ".join(recipients), ok,
+                                                    detail[:500]))
+
+    def sent_on(self, report_date: str, kind: str = "daily") -> bool:
+        rows = self._exec("SELECT COUNT(*) AS n FROM email_log WHERE report_date = ? AND kind = ? AND ok = ?",
+                          (report_date, kind, True), fetch=True)
+        return bool(rows and rows[0]["n"])
+
+    def email_history(self, limit: int = 15) -> list[dict]:
+        rows = self._exec("SELECT kind, report_date, sent_at, recipients, ok, detail FROM email_log "
+                          "ORDER BY sent_at DESC LIMIT ?", (limit,), fetch=True)
+        return [{k: _txt(v) if k != "ok" else bool(v) for k, v in r.items()} for r in rows]
 
     # -- read-only SQL for the query page
     def run_query(self, sql: str, limit: int = 5000) -> pd.DataFrame:
@@ -619,13 +664,8 @@ def demo_note(store):
 
 
 # ---------------------------------------------------------------- pages
-@db_safe
-def page_checkin():
-    store = get_store()
-    header("Check-in", "Tick people as they arrive — every phone sees the same list within seconds", store, live=True)
-    if not gate(store):
-        return
-    demo_note(store)
+def checkin_panel(store):
+    """Ushers tick people as they arrive; ticks from every phone sync within seconds."""
     _, per_row = layout_prefs(names=True)
     c1, c2, c3 = st.columns([1, 2, 2], vertical_alignment="bottom")
     day = c1.date_input("Service date", value=today(), format="DD/MM/YYYY")
@@ -653,7 +693,7 @@ def page_checkin():
         k[1].metric("Not yet", f"{max(len(members) - len(present), 0)}", border=True)
         k[2].metric("First-timers today", f"{sum(1 for m in members if m['id'] in present and m.get('type') == 'first_timer')}",
                     border=True)
-        with st.container(border=True):
+        with card("ci_list"):
             st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · showing {len(shown)} of {len(members)}")
             cols = st.columns(per_row)
             for i, m in enumerate(shown):
@@ -681,16 +721,192 @@ def page_checkin():
                 st.rerun()
 
 
+# ---------------------------------------------------------------- dashboard (home)
+def _esc(v) -> str:
+    import html
+    return html.escape(str(v or ""))
+
+
+def _delta(n: float | None, unit: str = "", suffix: str = "vs previous") -> str:
+    """Up/down arrow + change. Arrow carries the colour; the words stay in text ink."""
+    if n is None:
+        return f'<span class="kpi-sub">{_esc(suffix)}</span>'
+    arrow, cls = ("▲", "up") if n > 0 else ("▼", "down") if n < 0 else ("■", "flat")
+    val = f"{abs(n):.0f}{unit}" if isinstance(n, (int, float)) else _esc(n)
+    return f'<span class="kpi-delta {cls}"><i>{arrow}</i> {val}</span> <span class="kpi-sub">{_esc(suffix)}</span>'
+
+
+def kpi_row(items: list[dict]) -> str:
+    cells = "".join(
+        f'<div class="kpi"><div class="kpi-top"><span class="kpi-icon">{it.get("icon", "")}</span>'
+        f'<span class="kpi-label">{_esc(it["label"])}</span></div>'
+        f'<div class="kpi-value">{it["value"]}</div><div class="kpi-foot">{it.get("foot", "")}</div></div>'
+        for it in items)
+    return f'<div class="kpi-grid">{cells}</div>'
+
+
+def _ago(iso: str) -> str:
+    t = pd.to_datetime(iso, errors="coerce", utc=True)
+    if pd.isna(t):
+        return ""
+    mins = (pd.Timestamp.now(tz="UTC") - t).total_seconds() / 60
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{mins:.0f} min ago"
+    if mins < 60 * 24:
+        return f"{mins / 60:.0f} h ago"
+    return t.tz_convert(TZ).strftime("%a %d %b")
+
+
+def feed(title: str, rows: list[tuple[str, str, str]], empty: str) -> str:
+    """rows: (icon, main text (already escaped/HTML), small muted text)."""
+    body = "".join(f'<li><span class="feed-ic">{ic}</span><div><div>{main}</div><small>{_esc(sub)}</small></div></li>'
+                   for ic, main, sub in rows) or f'<li class="feed-empty">{_esc(empty)}</li>'
+    return f'<div class="feed"><h4>{_esc(title)}</h4><ul>{body}</ul></div>'
+
+
 @db_safe
-def page_followup():
+def page_dashboard():
     store = get_store()
-    header("Follow-up", f"Who we haven't seen — {RED_AT}+ services missed in a row is red, "
-                        f"{YELLOW_AT}–{RED_AT - 1} is yellow", store, live=True)
+    header("Dashboard", "Attendance at a glance — updates itself every 30 seconds", store, live=True)
     if not gate(store):
         return
     demo_note(store)
+
+    @st.fragment(run_every=30)
+    @db_safe
+    def body():
+        members, services = store.list_members(), store.list_services()
+        mem = {m["id"]: m for m in members}
+        tday = today().isoformat()
+        past = sorted([x for x in services if x.get("date", "") <= tday], key=lambda x: x["date"])
+        df = missed_streaks(members, services)
+        pending = store.count_pending()
+        if not past:
+            st.info("No services recorded yet — tick people on **Follow-up & Check-in → Check-in** to get started.")
+            return
+
+        counts = [len(x.get("present") or {}) for x in past]
+        last, prev = past[-1], (past[-2] if len(past) > 1 else None)
+        n_last, n_prev = counts[-1], (counts[-2] if len(counts) > 1 else None)
+        avg4 = sum(counts[-4:]) / len(counts[-4:])
+        prev4 = counts[-8:-4]
+        red = int((df.level == "red").sum()) if not df.empty else 0
+        yellow = int((df.level == "yellow").sum()) if not df.empty else 0
+        ok = int((df.level == "ok").sum()) if not df.empty else 0
+        month = tday[:7]
+        ft_month = [m for m in members if (m.get("first_visit") or "").startswith(month)]
+        last_day = dt.date.fromisoformat(last["date"])
+
+        st.html(kpi_row([
+            dict(icon="👥", label=f"Last service · {last_day:%d %b}", value=n_last,
+                 foot=_delta(n_last - n_prev if n_prev is not None else None, "",
+                             f"vs {dt.date.fromisoformat(prev['date']):%d %b}" if prev else "first service")),
+            dict(icon="📈", label="Average · last 4 services", value=f"{avg4:.0f}",
+                 foot=_delta(avg4 - sum(prev4) / len(prev4) if prev4 else None, "", "vs the 4 before")),
+            dict(icon="🔔", label="Need a follow-up call", value=red + yellow,
+                 foot=f'<span class="pill red">● {red} red</span> <span class="pill amber">● {yellow} yellow</span>'),
+            dict(icon="✨", label=f"First-timers · {today():%B}", value=len(ft_month),
+                 foot=(f'<span class="pill blue">{pending} sign-up{"s" if pending != 1 else ""} to approve</span>'
+                       if pending else '<span class="kpi-sub">no sign-ups waiting</span>')),
+        ]))
+
+        left, right = st.container(key="dash_row").columns([2.2, 1], gap="medium")
+        with left:
+            a, b = st.container(key="dash_charts").columns([1, 1.35], gap="medium")
+            with a:  # donut: where everyone on the register stands
+                fig = go.Figure(go.Pie(
+                    labels=["On track", "Yellow", "Red"], values=[ok, yellow, red], hole=0.72, sort=False,
+                    marker=dict(colors=[STATUS["ok"], STATUS["yellow"], STATUS["red"]],
+                                line=dict(color="#141c22", width=2)),
+                    textinfo="none", hovertemplate="%{label}: %{value} people (%{percent})<extra></extra>"))
+                fig.add_annotation(text=f"<b style='font-size:30px;color:{INK['primary']}'>{ok + yellow + red}</b>"
+                                        f"<br><span style='color:{INK['secondary']}'>on the register</span>",
+                                   showarrow=False, x=0.5, y=0.5)
+                fig.update_layout(showlegend=True, legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"))
+                _plot(fig, 330, "Where everyone stands", key="dash_donut")
+            with b:  # trend: people present per service, members vs first-timers
+                rows = []
+                for x in past[-12:]:
+                    p = x.get("present") or {}
+                    ftn = sum(1 for mid in p if mem.get(mid, {}).get("type") == "first_timer")
+                    rows.append(dict(date=pd.to_datetime(x["date"]), members=len(p) - ftn, first_timers=ftn))
+                tr = pd.DataFrame(rows)
+                fig = go.Figure()
+                fig.add_scatter(x=tr.date, y=tr.members, name="Members", mode="lines", stackgroup="one",
+                                line=dict(color=SERIES["members"], width=2), fillcolor="rgba(42,166,134,0.35)",
+                                hovertemplate="%{y} members<extra></extra>")
+                fig.add_scatter(x=tr.date, y=tr.first_timers, name="First-timers", mode="lines", stackgroup="one",
+                                line=dict(color=SERIES["first_timers"], width=2), fillcolor="rgba(90,142,240,0.35)",
+                                hovertemplate="%{y} first-timers<extra></extra>")
+                fig.update_layout(hovermode="x unified")
+                fig.update_xaxes(tickformat="%d %b")
+                _plot(fig, 330, f"People present · last {len(tr)} services", key="dash_trend")
+
+            with card("dash_followup"):
+                st.markdown(f"**Needs a follow-up call** · {red + yellow} people")
+                need = df[df.level != "ok"].head(8) if not df.empty else df
+                if need.empty:
+                    st.caption("Nobody has missed 3 or more services in a row. 🎉")
+                else:
+                    trs = "".join(
+                        f'<tr><td><span class="dot {r.level}"></span>{_esc(r.name)}</td>'
+                        f'<td><span class="pill {"red" if r.level == "red" else "amber"}">'
+                        f'{"Red" if r.level == "red" else "Yellow"} · {r.missed} missed</span></td>'
+                        f'<td>{_esc(pd.to_datetime(r.last_seen).strftime("%d %b") if r.last_seen else "Not yet")}</td>'
+                        f'<td class="muted">{_esc(r.phone) or "—"}</td></tr>' for r in need.itertuples())
+                    st.html(f'<table class="dash-table"><thead><tr><th>Name</th><th>Status</th><th>Last seen</th>'
+                            f'<th>Phone</th></tr></thead><tbody>{trs}</tbody></table>')
+                    if red + yellow > len(need):
+                        st.caption(f"+ {red + yellow - len(need)} more on the Follow-up page.")
+
+        with right, card("dash_side"):
+            today_svc = store.get_service(tday) or {}
+            here = today_svc.get("present") or {}
+            notes = []
+            if pending:
+                notes.append(("📝", f"<b>{pending}</b> welcome-form sign-up{'s' if pending != 1 else ''} to approve",
+                              "Members → Sign-ups"))
+            if red:
+                notes.append(("🔴", f"<b>{red}</b> {'person has' if red == 1 else 'people have'} missed {RED_AT}+ in a row",
+                              "Follow-up"))
+            notes.append(("✅", f"<b>{len(here)}</b> checked in today" if here else "No check-ins yet today",
+                          f"{today():%A %d %B}"))
+            src = here or (last.get("present") or {})
+            arrivals = sorted(src.items(), key=lambda kv: kv[1] or "", reverse=True)[:6]
+            act = [("✨" if mem.get(mid, {}).get("type") == "first_timer" else "🙋",
+                    _esc(mem.get(mid, {}).get("full_name", "(removed)")), _ago(at)) for mid, at in arrivals]
+            call = [] if df.empty else [
+                ("📞", f"{_esc(r.name)}", f"{r.phone or 'no phone'} · {r.missed} missed")
+                for r in df[df.level == "red"].head(5).itertuples()]
+            send_now_button(store, "dash_send_now")
+            st.html(feed("Notifications", notes, "All caught up")
+                    + feed("Latest check-ins" + ("" if here else f" · {last_day:%d %b}"), act, "No check-ins yet")
+                    + feed("Call next", call, "No one in red — great!"))
+        st.caption(f"Updated {dt.datetime.now(TZ):%H:%M:%S}")
+
+    body()
+
+
+@db_safe
+def page_followup():
+    store = get_store()
+    header("Follow-up & Check-in", f"Tick people in on the day, and see who we haven't seen — {RED_AT}+ services "
+                                   f"missed in a row is red, {YELLOW_AT}–{RED_AT - 1} is yellow", store, live=True)
+    if not gate(store):
+        return
+    demo_note(store)
+    tab_fu, tab_ci = st.tabs([":material/notification_important: Needs follow-up", ":material/how_to_reg: Check-in"])
+    with tab_fu:
+        followup_panel(store)
+    with tab_ci:
+        checkin_panel(store)
+
+
+def followup_panel(store):
     show = st.segmented_control("Show", ["Needs follow-up", "Red only", "Yellow only", "Everyone"],
-                                default="Needs follow-up") or "Needs follow-up"
+                                default="Needs follow-up", key="fu_show") or "Needs follow-up"
 
     @st.fragment(run_every=30)
     @db_safe
@@ -699,7 +915,7 @@ def page_followup():
         df = missed_streaks(members, services)
         past = sorted([s for s in services if s.get("date", "") <= today().isoformat()], key=lambda s: s["date"])
         if df.empty or not past:
-            st.info("No services recorded yet. Tick people on the **Check-in** page and this list fills itself in.")
+            st.info("No services recorded yet. Tick people on the **Check-in** tab and this list fills itself in.")
             return
         red, yellow = int((df.level == "red").sum()), int((df.level == "yellow").sum())
         k = st.columns(4)
@@ -722,7 +938,7 @@ def page_followup():
         def tint(col):
             return [f"background-color: {'rgba(208,59,59,.20)' if 'Red' in v else 'rgba(250,178,25,.25)' if 'Yellow' in v else ''}"
                     for v in col]
-        with st.container(border=True):
+        with card("fu_list"):
             st.markdown(f"**Priority list** · {len(view)} people · most-missed first")
             st.dataframe(table.style.apply(tint, subset=["Status"]), hide_index=True, width="stretch",
                          height=min(38 * (len(table) + 1) + 4, 560),
@@ -735,10 +951,10 @@ def page_followup():
         trend = pd.DataFrame([dict(date=s["date"], present=len(s.get("present") or {})) for s in past[-26:]])
         trend["date"] = pd.to_datetime(trend.date)
         fig = px.bar(trend, x="date", y="present", labels={"present": "People present", "date": ""})
-        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
+        fig.update_traces(marker_color=SERIES["members"], hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
         fig.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10), bargap=0.25,
                           title=dict(text="Attendance per service", font=dict(size=15)))
-        with st.container(border=True):
+        with card("fu_trend"):
             st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
         st.caption(f"Live · recalculated {dt.datetime.now(TZ):%H:%M:%S} · only services since someone joined "
                    "or first visited count against them.")
@@ -902,7 +1118,7 @@ def signups(store):
     by_name = {norm(m["full_name"]): m for m in store.list_members()}
     for r in regs:
         match = by_name.get(norm(r["full_name"]))
-        with st.container(border=True):
+        with card(f"signup_{r['id']}"):
             top = st.columns([3, 2], vertical_alignment="center")
             submitted = _parse_times([r["created_at"]]).iloc[0]
             top[0].markdown(f"**{r['full_name']}**" + (" · :orange[prefers no contact]" if not r["wants_contact"] else ""))
@@ -932,11 +1148,27 @@ def _parse_times(values) -> pd.Series:
     return t.dt.tz_convert(TZ)
 
 
-def _plot(fig, height=320, title=None):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 10, b=10),
-                      title=dict(text=title, font=dict(size=15)) if title else None,
-                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, title=None))
-    with st.container(border=True):
+def _style(fig, height=320, title=None):
+    """Dark card styling shared by every chart: transparent background, recessive grid, readable ink."""
+    fig.update_layout(height=height, margin=dict(l=8, r=8, t=44 if title else 8, b=8),
+                      title=dict(text=title, font=dict(size=15, color=INK["primary"])) if title else None,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color=INK["secondary"]),
+                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, title=None),
+                      hoverlabel=dict(bgcolor="#1d2830", bordercolor="#2c3b46", font=dict(color=INK["primary"])))
+    fig.update_xaxes(showgrid=False, linecolor=INK["grid"], tickfont=dict(color=INK["secondary"]))
+    fig.update_yaxes(gridcolor=INK["grid"], zeroline=False, tickfont=dict(color=INK["secondary"]))
+    return fig
+
+
+def card(name: str):
+    """A rounded dark card (bordered container), styled in app.py via its st-key-card_* class."""
+    return st.container(border=True, key="card_" + re.sub(r"\W+", "_", name.lower()).strip("_"))
+
+
+def _plot(fig, height=320, title=None, key=None):
+    _style(fig, height, title)
+    with card(key or title or "chart"):
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
@@ -994,10 +1226,10 @@ def page_live():
                     arr["arrived"] = arr["n"].cumsum()
                     fig = px.line(arr, x="time", y="arrived", line_shape="hv", markers=True,
                                   labels={"arrived": "Checked in", "time": ""})
-                    fig.update_traces(line=dict(width=2, color=BRAND["teal"]), marker=dict(size=6),
+                    fig.update_traces(line=dict(width=2, color=SERIES["members"]), marker=dict(size=8),
                                       hovertemplate="%{x|%H:%M}: %{y} checked in<extra></extra>")
                     _plot(fig, 330, "Arrivals so far")
-            with c2.container(border=True):
+            with c2, card("live_latest"):
                 st.markdown("**Latest arrivals**")
                 latest = ev.sort_values("time", ascending=False).head(12)
                 st.dataframe(pd.DataFrame({
@@ -1046,11 +1278,11 @@ def page_insights():
     long = per.melt(id_vars="date", value_vars=["members", "first_timers"], var_name="who", value_name="n")
     long["who"] = long.who.map({"members": "Members", "first_timers": "First-timers"})
     fig = px.bar(long, x="date", y="n", color="who", barmode="stack",
-                 color_discrete_map={"Members": BRAND["teal"], "First-timers": BRAND["navy"]},
+                 color_discrete_map={"Members": SERIES["members"], "First-timers": SERIES["first_timers"]},
                  category_orders={"who": ["Members", "First-timers"]}, labels={"n": "People", "date": ""})
     fig.update_traces(marker_line_width=0, hovertemplate="%{x|%d %b %Y}: %{y}<extra>%{fullData.name}</extra>")
     fig.add_scatter(x=per.date, y=per.avg4, mode="lines", name="4-service average",
-                    line=dict(color=BRAND["slate"], width=2, dash="dot"), hovertemplate="%{y:.1f}<extra>4-service avg</extra>")
+                    line=dict(color=INK["secondary"], width=2, dash="dot"), hovertemplate="%{y:.1f}<extra>4-service avg</extra>")
     fig.update_layout(bargap=0.25, hovermode="x unified")
     _plot(fig, 360, "Attendance per service")
 
@@ -1058,14 +1290,14 @@ def page_insights():
     with c1:
         ft = pd.DataFrame([m for m in members if m.get("first_visit")])
         if ft.empty:
-            with st.container(border=True):
+            with card("ins_ft_empty"):
                 st.markdown("**First-timers per month**")
                 st.caption("No first-visit dates yet.")
         else:
             ft["month"] = pd.to_datetime(ft.first_visit).dt.to_period("M").dt.to_timestamp()
             by_m = ft.groupby("month").size().rename("n").reset_index()
             fig = px.bar(by_m, x="month", y="n", labels={"n": "First-timers", "month": ""})
-            fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%b %Y}: %{y}<extra></extra>")
+            fig.update_traces(marker_color=SERIES["first_timers"], hovertemplate="%{x|%b %Y}: %{y}<extra></extra>")
             fig.update_layout(bargap=0.3)
             _plot(fig, 300, "First-timers per month")
     with c2:
@@ -1076,7 +1308,7 @@ def page_insights():
             first = m.get("first_visit") or (dates[0] if dates else None)
             if first and any(d > first for d in dates):
                 came_back += 1
-        with st.container(border=True):
+        with card("ins_ft_back"):
             st.markdown("**Did first-timers come back?**")
             a, b = st.columns(2)
             a.metric("First-timers", len(fts))
@@ -1092,8 +1324,108 @@ def page_insights():
     if grp:
         gdf = pd.DataFrame({"group": list(grp), "avg": [v / len(past[-8:]) for v in grp.values()]}).sort_values("avg")
         fig = px.bar(gdf, x="avg", y="group", orientation="h", labels={"avg": "Average per service", "group": ""})
-        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
+        fig.update_traces(marker_color=SERIES["members"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
         _plot(fig, max(220, 36 * len(gdf) + 90), f"Attendance by group (last {len(past[-8:])} services)")
+
+
+
+# ---------------------------------------------------------------- email report
+def _smtp():
+    try:
+        return st.secrets.get("smtp_user"), st.secrets.get("smtp_password")
+    except Exception:
+        return None, None
+
+
+def send_now_button(store, key: str, label: str = "Email today's report now", full: bool = False):
+    """Sends the report straight away to everyone on the list. Returns True if sent."""
+    import report as R
+    user, pw = _smtp()
+    if st.button(label, key=key, icon=":material/forward_to_inbox:", type="primary" if full else "secondary",
+                 width="stretch", disabled=store.demo or not (user and pw),
+                 help=None if (user and pw) else "Add smtp_user and smtp_password in the app's Secrets first "
+                                                 "(see Reports)."):
+        with st.spinner("Sending…"):
+            try:
+                out = R.send(store, user, pw, kind="manual")
+                st.toast(f"Report sent to {', '.join(out['to'])}", icon=":material/mark_email_read:")
+                return True
+            except Exception as e:
+                st.error(f"Couldn't send the email: {e}", icon=":material/error:")
+    return False
+
+
+REPORT_SETUP = """
+**One-time setup (about 5 minutes)**
+
+1. **Gmail app password** — sign in to the church Gmail that will *send* the report (e.g. greaterloveauckland@gmail.com)
+   → **Google Account → Security → 2-Step Verification** (turn it on if it's off) → **App passwords** →
+   create one called *FCC Attendance*. Google shows a 16-letter password once — copy it.
+2. **This app** — share.streamlit.io → *fcc-attendance* → ⋮ → **Settings → Secrets**, add two lines:
+   ```toml
+   smtp_user = "greaterloveauckland@gmail.com"
+   smtp_password = "the 16-letter app password"
+   ```
+3. **The 5pm schedule** — github.com/Kellyzicoder/fcc-attendance → **Settings → Secrets and variables → Actions →
+   New repository secret**, add three: `DATABASE_URL` (same as in the app's Secrets), `SMTP_USER`, `SMTP_PASSWORD`.
+
+Then press **Send report now** below to test. The daily email goes out between 4:40 and 5pm NZ time; if it ever fails,
+GitHub emails the repo owner, and later attempts that evening keep trying.
+"""
+
+
+@db_safe
+def page_reports():
+    import report as R
+    store = get_store()
+    header("Reports", "The 5pm email to church leaders — who gets it, what's in it, and send it now", store)
+    if not gate(store):
+        return
+    demo_note(store)
+    user, pw = _smtp()
+    left, right = st.columns([1, 1.4], gap="medium")
+    with left:
+        with card("rep_send"):
+            st.markdown("**Send the report**")
+            st.caption("Goes out automatically every day by 5pm (NZ). Use this to send the latest numbers any time — "
+                       "e.g. straight after the service, before 6pm.")
+            if not (user and pw):
+                st.warning("Email isn't set up yet — see the steps below.", icon=":material/settings:")
+            send_now_button(store, "rep_send_now", "Send report now", full=True)
+        with card("rep_to"):
+            st.markdown("**Who gets it**")
+            current = R.recipients(store)
+            text = st.text_area("Email addresses (one per line)", "\n".join(current), height=130, key="rep_to_text",
+                                disabled=store.demo)
+            if st.button("Save recipients", key="rep_save", icon=":material/save:", disabled=store.demo):
+                good, bad = R.save_recipients(store, text)
+                if bad:
+                    st.error("Not saved — these don't look like email addresses: " + ", ".join(bad))
+                elif good:
+                    st.success(f"Saved {len(good)} recipient{'s' if len(good) != 1 else ''}.")
+                else:
+                    st.error("Add at least one email address.")
+        with card("rep_log"):
+            st.markdown("**Recent emails**")
+            hist = store.email_history(10)
+            if not hist:
+                st.caption("Nothing sent yet.")
+            else:
+                st.dataframe(pd.DataFrame({
+                    "Sent": _parse_times([h["sent_at"] for h in hist]).dt.strftime("%a %d %b %H:%M"),
+                    "Type": ["5pm (automatic)" if h["kind"] == "daily" else "Sent from the app" for h in hist],
+                    "": ["✅ Sent" if h["ok"] else "❌ Failed" for h in hist],
+                    "Details": [h["detail"] for h in hist]}), hide_index=True, width="stretch")
+        with st.expander("Set up email sending", icon=":material/settings:", expanded=not (user and pw)):
+            st.markdown(REPORT_SETUP)
+    with right, card("rep_preview"):
+        r = R.build(store)
+        st.markdown(f"**Preview** · {r['subject']}")
+        import streamlit.components.v1 as components
+        components.html(r["html"], height=900, scrolling=True)
+        st.download_button("Download the Excel attachment", r["xlsx"], r["filename"],
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           icon=":material/table_view:")
 
 
 REGISTRATIONS_SQL = """-- Sign-ups from the FCC welcome form. Safe to run more than once.
@@ -1220,7 +1552,7 @@ def page_sql():
     demo_note(store)
     mode, _ = layout_prefs()
     left, right = (st.container(), st.container()) if mode == "Stacked" else st.columns([2, 5])
-    with left.container(border=True):
+    with left, card("sql_tables"):
         st.markdown("**Tables**")
         st.code("members\n  id, full_name, phone,\n  email, group_name, role,\n  status, type,\n  date_joined, first_visit,\n"
                 "  invited_by, follow_up\n\nservices\n  service_date, name\n\nattendance\n"
@@ -1244,7 +1576,7 @@ def page_sql():
         if err:
             st.error(err, icon=":material/error:")
         elif df is not None:
-            with st.container(border=True):
+            with card("sql_result"):
                 st.caption(f"{len(df):,} rows · {secs * 1000:.0f} ms" + (" · first 5,000 shown" if len(df) >= 5000 else ""))
                 st.dataframe(df, hide_index=True, width="stretch", height=min(38 * (len(df) + 1) + 4, 520))
                 st.download_button("Download results (CSV)", df.to_csv(index=False), "query_results.csv", "text/csv",

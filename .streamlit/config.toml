@@ -1,5 +1,12 @@
-[theme.light]
-primaryColor = "#208088"
-
-[theme.dark]
+# Dark dashboard theme in the church colours (logo: navy #2c4b77, teal #208088, green #2aa686, gold #ffcf00)
+[theme]
+base = "dark"
 primaryColor = "#2aa686"
+backgroundColor = "#0e1418"
+secondaryBackgroundColor = "#18222a"
+textColor = "#e8eef2"
+borderColor = "#243039"
+font = "sans-serif"
+
+[server]
+runOnSave = true

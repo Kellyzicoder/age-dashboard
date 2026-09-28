@@ -3,3 +3,4 @@ pandas>=2.2
 numpy>=1.26
 plotly>=5.22
 psycopg[binary]>=3.2
+openpyxl>=3.1
