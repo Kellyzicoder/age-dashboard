@@ -1,0 +1,58 @@
+name: Daily attendance email
+
+# Sends the report by ~5pm New Zealand time, every day.
+# GitHub cron runs in UTC and can start a few minutes late, so it tries several times (covering both
+# NZST UTC+12 and NZDT UTC+13); the script sends on the first run after 4:40pm NZ and skips the rest.
+on:
+  schedule:
+    - cron: "40 3 * * *"   # 4:40pm NZDT
+    - cron: "55 3 * * *"
+    - cron: "10 4 * * *"
+    - cron: "40 4 * * *"   # 4:40pm NZST / 5:40pm NZDT
+    - cron: "55 4 * * *"
+    - cron: "10 5 * * *"
+    - cron: "40 5 * * *"   # last catch-up
+  workflow_dispatch:
+    inputs:
+      force:
+        description: "Send now, even if today's report already went out"
+        type: boolean
+        default: false
+
+concurrency:
+  group: daily-report
+  cancel-in-progress: false
+
+jobs:
+  send:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - name: Check the time in New Zealand
+        id: window
+        run: |
+          now=$(TZ=Pacific/Auckland date +%H%M)
+          echo "NZ time: $now"
+          if [ "${{ inputs.force }}" = "true" ] || { [ "$now" -ge 1640 ] && [ "$now" -lt 1900 ]; }; then
+            echo "go=yes" >> "$GITHUB_OUTPUT"
+          else
+            echo "go=no" >> "$GITHUB_OUTPUT"
+          fi
+      - uses: actions/checkout@v4
+        if: steps.window.outputs.go == 'yes'
+      - uses: actions/setup-python@v5
+        if: steps.window.outputs.go == 'yes'
+        with:
+          python-version: "3.12"
+          cache: pip
+      - name: Install
+        if: steps.window.outputs.go == 'yes'
+        run: pip install -q -r requirements.txt
+      - name: Send report
+        if: steps.window.outputs.go == 'yes'
+        env:
+          DATABASE_URL: ${{ secrets.DATABASE_URL }}
+          SMTP_USER: ${{ secrets.SMTP_USER }}
+          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          FORCE: ${{ inputs.force && '1' || '0' }}
+        run: python scripts/daily_report.py
