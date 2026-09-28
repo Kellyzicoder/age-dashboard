@@ -52,7 +52,7 @@ jobs:
         if: steps.window.outputs.go == 'yes'
         env:
           DATABASE_URL: ${{ secrets.DATABASE_URL }}
-          SMTP_USER: ${{ secrets.SMTP_USER }}
-          SMTP_PASSWORD: ${{ secrets.SMTP_PASSWORD }}
+          BREVO_API_KEY: ${{ secrets.BREVO_API_KEY }}
+          REPORT_SENDER: ${{ secrets.REPORT_SENDER }}
           FORCE: ${{ inputs.force && '1' || '0' }}
         run: python scripts/daily_report.py
