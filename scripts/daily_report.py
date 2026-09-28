@@ -1,7 +1,7 @@
 """Send the 5pm attendance email. Run by .github/workflows/daily-report.yml (or by hand).
 
 Safe to run many times: it only sends once per day (checked in the email_log table), and only inside
-the evening window unless FORCE=1. Needs env vars DATABASE_URL, SMTP_USER, SMTP_PASSWORD.
+the evening window unless FORCE=1. Needs env vars DATABASE_URL and BREVO_API_KEY (REPORT_SENDER optional).
 """
 import os
 import sys
@@ -22,15 +22,15 @@ def main() -> int:
     if not force and not (WINDOW[0] <= now.time() < WINDOW[1]):
         print(f"{now:%H:%M} NZ is outside the send window — nothing to do.")
         return 0
-    missing = [k for k in ("DATABASE_URL", "SMTP_USER", "SMTP_PASSWORD") if not os.environ.get(k)]
-    if missing:
-        print("Missing secrets: " + ", ".join(missing))
+    cfg = R.mail_config(os.environ.get)
+    if not os.environ.get("DATABASE_URL") or not cfg["ready"]:
+        print("Missing secrets: DATABASE_URL and BREVO_API_KEY (or SMTP_USER + SMTP_PASSWORD) are required.")
         return 1
     store = A.SqlStore(os.environ["DATABASE_URL"])
     if not force and store.sent_on(now.date().isoformat(), "daily"):
         print(f"Today's report was already sent — skipping.")
         return 0
-    out = R.send(store, os.environ["SMTP_USER"], os.environ["SMTP_PASSWORD"], kind="daily" if not force else "manual")
+    out = R.send(store, cfg, kind="daily" if not force else "manual")
     print(f"Sent “{out['subject']}” to {', '.join(out['to'])}")
     return 0
 
