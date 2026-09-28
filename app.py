@@ -20,7 +20,10 @@ st.html("""
 :root {--card: #141c22; --card-line: rgba(255,255,255,.07); --ink: #e8eef2; --ink-2: #9fb0bd; --ink-3: #6b7c89;
        --green: #2aa686; --blue: #5a8ef0; --amber: #fab219; --red: #d03b3b; --gold: #ffcf00;}
 html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSidebar"] {font-family: 'Inter', system-ui, sans-serif;}
-.block-container {padding-top: 1.4rem; padding-bottom: 3rem; max-width: 1480px;}
+.block-container {padding-top: 3.2rem; padding-bottom: 3rem; max-width: 1480px;}
+/* Streamlit's top toolbar: keep the menu, drop the dark strip that covered the banner */
+[data-testid="stHeader"] {background: transparent; box-shadow: none;}
+[data-testid="stDecoration"] {display: none;}
 [data-testid="stSidebar"] {border-right: 1px solid var(--card-line);}
 
 /* cards: every bordered container made with card() */
