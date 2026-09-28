@@ -14,6 +14,7 @@ Tables (same in SQLite and Postgres):
 from __future__ import annotations
 
 import datetime as dt
+import re
 import threading
 import uuid
 from zoneinfo import ZoneInfo
@@ -21,6 +22,7 @@ from zoneinfo import ZoneInfo
 import numpy as np
 import pandas as pd
 import plotly.express as px
+import plotly.graph_objects as go
 import streamlit as st
 
 TZ = ZoneInfo("Pacific/Auckland")
@@ -28,6 +30,10 @@ BRAND = dict(navy="#2c4b77", teal="#208088", green="#2aa686", slate="#293641", g
 YELLOW_AT, RED_AT = 3, 5          # services missed in a row
 INACTIVE = {"inactive", "moved", "left", "deceased", "transferred"}
 AMBER, CRIMSON = "#fab219", "#d03b3b"   # reserved status colours (always shown with icon + label)
+# Chart colours, validated for colour-blind separation and contrast on the dark surface (#141c22).
+SERIES = dict(members="#2aa686", first_timers="#5a8ef0")
+STATUS = dict(ok="#2aa686", yellow=AMBER, red=CRIMSON)
+INK = dict(primary="#e8eef2", secondary="#9fb0bd", muted="#6b7c89", grid="rgba(255,255,255,0.06)")
 
 
 def today() -> dt.date:
@@ -619,13 +625,8 @@ def demo_note(store):
 
 
 # ---------------------------------------------------------------- pages
-@db_safe
-def page_checkin():
-    store = get_store()
-    header("Check-in", "Tick people as they arrive — every phone sees the same list within seconds", store, live=True)
-    if not gate(store):
-        return
-    demo_note(store)
+def checkin_panel(store):
+    """Ushers tick people as they arrive; ticks from every phone sync within seconds."""
     _, per_row = layout_prefs(names=True)
     c1, c2, c3 = st.columns([1, 2, 2], vertical_alignment="bottom")
     day = c1.date_input("Service date", value=today(), format="DD/MM/YYYY")
@@ -653,7 +654,7 @@ def page_checkin():
         k[1].metric("Not yet", f"{max(len(members) - len(present), 0)}", border=True)
         k[2].metric("First-timers today", f"{sum(1 for m in members if m['id'] in present and m.get('type') == 'first_timer')}",
                     border=True)
-        with st.container(border=True):
+        with card("ci_list"):
             st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · showing {len(shown)} of {len(members)}")
             cols = st.columns(per_row)
             for i, m in enumerate(shown):
@@ -681,16 +682,191 @@ def page_checkin():
                 st.rerun()
 
 
+# ---------------------------------------------------------------- dashboard (home)
+def _esc(v) -> str:
+    import html
+    return html.escape(str(v or ""))
+
+
+def _delta(n: float | None, unit: str = "", suffix: str = "vs previous") -> str:
+    """Up/down arrow + change. Arrow carries the colour; the words stay in text ink."""
+    if n is None:
+        return f'<span class="kpi-sub">{_esc(suffix)}</span>'
+    arrow, cls = ("▲", "up") if n > 0 else ("▼", "down") if n < 0 else ("■", "flat")
+    val = f"{abs(n):.0f}{unit}" if isinstance(n, (int, float)) else _esc(n)
+    return f'<span class="kpi-delta {cls}"><i>{arrow}</i> {val}</span> <span class="kpi-sub">{_esc(suffix)}</span>'
+
+
+def kpi_row(items: list[dict]) -> str:
+    cells = "".join(
+        f'<div class="kpi"><div class="kpi-top"><span class="kpi-icon">{it.get("icon", "")}</span>'
+        f'<span class="kpi-label">{_esc(it["label"])}</span></div>'
+        f'<div class="kpi-value">{it["value"]}</div><div class="kpi-foot">{it.get("foot", "")}</div></div>'
+        for it in items)
+    return f'<div class="kpi-grid">{cells}</div>'
+
+
+def _ago(iso: str) -> str:
+    t = pd.to_datetime(iso, errors="coerce", utc=True)
+    if pd.isna(t):
+        return ""
+    mins = (pd.Timestamp.now(tz="UTC") - t).total_seconds() / 60
+    if mins < 1:
+        return "just now"
+    if mins < 60:
+        return f"{mins:.0f} min ago"
+    if mins < 60 * 24:
+        return f"{mins / 60:.0f} h ago"
+    return t.tz_convert(TZ).strftime("%a %d %b")
+
+
+def feed(title: str, rows: list[tuple[str, str, str]], empty: str) -> str:
+    """rows: (icon, main text (already escaped/HTML), small muted text)."""
+    body = "".join(f'<li><span class="feed-ic">{ic}</span><div><div>{main}</div><small>{_esc(sub)}</small></div></li>'
+                   for ic, main, sub in rows) or f'<li class="feed-empty">{_esc(empty)}</li>'
+    return f'<div class="feed"><h4>{_esc(title)}</h4><ul>{body}</ul></div>'
+
+
 @db_safe
-def page_followup():
+def page_dashboard():
     store = get_store()
-    header("Follow-up", f"Who we haven't seen — {RED_AT}+ services missed in a row is red, "
-                        f"{YELLOW_AT}–{RED_AT - 1} is yellow", store, live=True)
+    header("Dashboard", "Attendance at a glance — updates itself every 30 seconds", store, live=True)
     if not gate(store):
         return
     demo_note(store)
+
+    @st.fragment(run_every=30)
+    @db_safe
+    def body():
+        members, services = store.list_members(), store.list_services()
+        mem = {m["id"]: m for m in members}
+        tday = today().isoformat()
+        past = sorted([x for x in services if x.get("date", "") <= tday], key=lambda x: x["date"])
+        df = missed_streaks(members, services)
+        pending = store.count_pending()
+        if not past:
+            st.info("No services recorded yet — tick people on **Follow-up & Check-in → Check-in** to get started.")
+            return
+
+        counts = [len(x.get("present") or {}) for x in past]
+        last, prev = past[-1], (past[-2] if len(past) > 1 else None)
+        n_last, n_prev = counts[-1], (counts[-2] if len(counts) > 1 else None)
+        avg4 = sum(counts[-4:]) / len(counts[-4:])
+        prev4 = counts[-8:-4]
+        red = int((df.level == "red").sum()) if not df.empty else 0
+        yellow = int((df.level == "yellow").sum()) if not df.empty else 0
+        ok = int((df.level == "ok").sum()) if not df.empty else 0
+        month = tday[:7]
+        ft_month = [m for m in members if (m.get("first_visit") or "").startswith(month)]
+        last_day = dt.date.fromisoformat(last["date"])
+
+        st.html(kpi_row([
+            dict(icon="👥", label=f"Last service · {last_day:%a %d %b}", value=n_last,
+                 foot=_delta(n_last - n_prev if n_prev is not None else None, "",
+                             f"vs {dt.date.fromisoformat(prev['date']):%d %b}" if prev else "first service")),
+            dict(icon="📈", label="Average · last 4 services", value=f"{avg4:.0f}",
+                 foot=_delta(avg4 - sum(prev4) / len(prev4) if prev4 else None, "", "vs the 4 before")),
+            dict(icon="🔔", label="Need a follow-up call", value=red + yellow,
+                 foot=f'<span class="pill red">● {red} red</span> <span class="pill amber">● {yellow} yellow</span>'),
+            dict(icon="✨", label=f"First-timers · {today():%B}", value=len(ft_month),
+                 foot=(f'<span class="pill blue">{pending} sign-up{"s" if pending != 1 else ""} to approve</span>'
+                       if pending else '<span class="kpi-sub">no sign-ups waiting</span>')),
+        ]))
+
+        left, right = st.columns([2.2, 1], gap="medium")
+        with left:
+            a, b = st.columns([1, 1.35], gap="medium")
+            with a:  # donut: where everyone on the register stands
+                fig = go.Figure(go.Pie(
+                    labels=["On track", "Yellow", "Red"], values=[ok, yellow, red], hole=0.72, sort=False,
+                    marker=dict(colors=[STATUS["ok"], STATUS["yellow"], STATUS["red"]],
+                                line=dict(color="#141c22", width=2)),
+                    textinfo="none", hovertemplate="%{label}: %{value} people (%{percent})<extra></extra>"))
+                fig.add_annotation(text=f"<b style='font-size:30px;color:{INK['primary']}'>{ok + yellow + red}</b>"
+                                        f"<br><span style='color:{INK['secondary']}'>on the register</span>",
+                                   showarrow=False, x=0.5, y=0.5)
+                fig.update_layout(showlegend=True, legend=dict(orientation="h", y=-0.05, x=0.5, xanchor="center"))
+                _plot(fig, 330, "Where everyone stands", key="dash_donut")
+            with b:  # trend: people present per service, members vs first-timers
+                rows = []
+                for x in past[-12:]:
+                    p = x.get("present") or {}
+                    ftn = sum(1 for mid in p if mem.get(mid, {}).get("type") == "first_timer")
+                    rows.append(dict(date=pd.to_datetime(x["date"]), members=len(p) - ftn, first_timers=ftn))
+                tr = pd.DataFrame(rows)
+                fig = go.Figure()
+                fig.add_scatter(x=tr.date, y=tr.members, name="Members", mode="lines", stackgroup="one",
+                                line=dict(color=SERIES["members"], width=2), fillcolor="rgba(42,166,134,0.35)",
+                                hovertemplate="%{y} members<extra></extra>")
+                fig.add_scatter(x=tr.date, y=tr.first_timers, name="First-timers", mode="lines", stackgroup="one",
+                                line=dict(color=SERIES["first_timers"], width=2), fillcolor="rgba(90,142,240,0.35)",
+                                hovertemplate="%{y} first-timers<extra></extra>")
+                fig.update_layout(hovermode="x unified")
+                fig.update_xaxes(tickformat="%d %b")
+                _plot(fig, 330, f"People present · last {len(tr)} services", key="dash_trend")
+
+            with card("dash_followup"):
+                st.markdown(f"**Needs a follow-up call** · {red + yellow} people")
+                need = df[df.level != "ok"].head(8) if not df.empty else df
+                if need.empty:
+                    st.caption("Nobody has missed 3 or more services in a row. 🎉")
+                else:
+                    trs = "".join(
+                        f'<tr><td><span class="dot {r.level}"></span>{_esc(r.name)}</td>'
+                        f'<td><span class="pill {"red" if r.level == "red" else "amber"}">'
+                        f'{"Red" if r.level == "red" else "Yellow"} · {r.missed} missed</span></td>'
+                        f'<td>{_esc(pd.to_datetime(r.last_seen).strftime("%d %b") if r.last_seen else "Not yet")}</td>'
+                        f'<td class="muted">{_esc(r.phone) or "—"}</td></tr>' for r in need.itertuples())
+                    st.html(f'<table class="dash-table"><thead><tr><th>Name</th><th>Status</th><th>Last seen</th>'
+                            f'<th>Phone</th></tr></thead><tbody>{trs}</tbody></table>')
+                    if red + yellow > len(need):
+                        st.caption(f"+ {red + yellow - len(need)} more on the Follow-up page.")
+
+        with right, card("dash_side"):
+            today_svc = store.get_service(tday) or {}
+            here = today_svc.get("present") or {}
+            notes = []
+            if pending:
+                notes.append(("📝", f"<b>{pending}</b> welcome-form sign-up{'s' if pending != 1 else ''} to approve",
+                              "Members → Sign-ups"))
+            if red:
+                notes.append(("🔴", f"<b>{red}</b> {'person has' if red == 1 else 'people have'} missed {RED_AT}+ in a row",
+                              "Follow-up"))
+            notes.append(("✅", f"<b>{len(here)}</b> checked in today" if here else "No check-ins yet today",
+                          f"{today():%A %d %B}"))
+            src = here or (last.get("present") or {})
+            arrivals = sorted(src.items(), key=lambda kv: kv[1] or "", reverse=True)[:6]
+            act = [("✨" if mem.get(mid, {}).get("type") == "first_timer" else "🙋",
+                    _esc(mem.get(mid, {}).get("full_name", "(removed)")), _ago(at)) for mid, at in arrivals]
+            call = [] if df.empty else [
+                ("📞", f"{_esc(r.name)}", f"{r.phone or 'no phone'} · {r.missed} missed")
+                for r in df[df.level == "red"].head(5).itertuples()]
+            st.html(feed("Notifications", notes, "All caught up")
+                    + feed("Latest check-ins" + ("" if here else f" · {last_day:%d %b}"), act, "No check-ins yet")
+                    + feed("Call next", call, "No one in red — great!"))
+        st.caption(f"Updated {dt.datetime.now(TZ):%H:%M:%S}")
+
+    body()
+
+
+@db_safe
+def page_followup():
+    store = get_store()
+    header("Follow-up & Check-in", f"Tick people in on the day, and see who we haven't seen — {RED_AT}+ services "
+                                   f"missed in a row is red, {YELLOW_AT}–{RED_AT - 1} is yellow", store, live=True)
+    if not gate(store):
+        return
+    demo_note(store)
+    tab_fu, tab_ci = st.tabs([":material/notification_important: Needs follow-up", ":material/how_to_reg: Check-in"])
+    with tab_fu:
+        followup_panel(store)
+    with tab_ci:
+        checkin_panel(store)
+
+
+def followup_panel(store):
     show = st.segmented_control("Show", ["Needs follow-up", "Red only", "Yellow only", "Everyone"],
-                                default="Needs follow-up") or "Needs follow-up"
+                                default="Needs follow-up", key="fu_show") or "Needs follow-up"
 
     @st.fragment(run_every=30)
     @db_safe
@@ -699,7 +875,7 @@ def page_followup():
         df = missed_streaks(members, services)
         past = sorted([s for s in services if s.get("date", "") <= today().isoformat()], key=lambda s: s["date"])
         if df.empty or not past:
-            st.info("No services recorded yet. Tick people on the **Check-in** page and this list fills itself in.")
+            st.info("No services recorded yet. Tick people on the **Check-in** tab and this list fills itself in.")
             return
         red, yellow = int((df.level == "red").sum()), int((df.level == "yellow").sum())
         k = st.columns(4)
@@ -722,7 +898,7 @@ def page_followup():
         def tint(col):
             return [f"background-color: {'rgba(208,59,59,.20)' if 'Red' in v else 'rgba(250,178,25,.25)' if 'Yellow' in v else ''}"
                     for v in col]
-        with st.container(border=True):
+        with card("fu_list"):
             st.markdown(f"**Priority list** · {len(view)} people · most-missed first")
             st.dataframe(table.style.apply(tint, subset=["Status"]), hide_index=True, width="stretch",
                          height=min(38 * (len(table) + 1) + 4, 560),
@@ -735,10 +911,10 @@ def page_followup():
         trend = pd.DataFrame([dict(date=s["date"], present=len(s.get("present") or {})) for s in past[-26:]])
         trend["date"] = pd.to_datetime(trend.date)
         fig = px.bar(trend, x="date", y="present", labels={"present": "People present", "date": ""})
-        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
+        fig.update_traces(marker_color=SERIES["members"], hovertemplate="%{x|%d %b %Y}: %{y} present<extra></extra>")
         fig.update_layout(height=300, margin=dict(l=10, r=10, t=40, b=10), bargap=0.25,
                           title=dict(text="Attendance per service", font=dict(size=15)))
-        with st.container(border=True):
+        with card("fu_trend"):
             st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
         st.caption(f"Live · recalculated {dt.datetime.now(TZ):%H:%M:%S} · only services since someone joined "
                    "or first visited count against them.")
@@ -902,7 +1078,7 @@ def signups(store):
     by_name = {norm(m["full_name"]): m for m in store.list_members()}
     for r in regs:
         match = by_name.get(norm(r["full_name"]))
-        with st.container(border=True):
+        with card(f"signup_{r['id']}"):
             top = st.columns([3, 2], vertical_alignment="center")
             submitted = _parse_times([r["created_at"]]).iloc[0]
             top[0].markdown(f"**{r['full_name']}**" + (" · :orange[prefers no contact]" if not r["wants_contact"] else ""))
@@ -932,11 +1108,27 @@ def _parse_times(values) -> pd.Series:
     return t.dt.tz_convert(TZ)
 
 
-def _plot(fig, height=320, title=None):
-    fig.update_layout(height=height, margin=dict(l=10, r=10, t=44 if title else 10, b=10),
-                      title=dict(text=title, font=dict(size=15)) if title else None,
-                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, title=None))
-    with st.container(border=True):
+def _style(fig, height=320, title=None):
+    """Dark card styling shared by every chart: transparent background, recessive grid, readable ink."""
+    fig.update_layout(height=height, margin=dict(l=8, r=8, t=44 if title else 8, b=8),
+                      title=dict(text=title, font=dict(size=15, color=INK["primary"])) if title else None,
+                      paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)",
+                      font=dict(color=INK["secondary"]),
+                      legend=dict(orientation="h", yanchor="top", y=-0.18, x=0, title=None),
+                      hoverlabel=dict(bgcolor="#1d2830", bordercolor="#2c3b46", font=dict(color=INK["primary"])))
+    fig.update_xaxes(showgrid=False, linecolor=INK["grid"], tickfont=dict(color=INK["secondary"]))
+    fig.update_yaxes(gridcolor=INK["grid"], zeroline=False, tickfont=dict(color=INK["secondary"]))
+    return fig
+
+
+def card(name: str):
+    """A rounded dark card (bordered container), styled in app.py via its st-key-card_* class."""
+    return st.container(border=True, key="card_" + re.sub(r"\W+", "_", name.lower()).strip("_"))
+
+
+def _plot(fig, height=320, title=None, key=None):
+    _style(fig, height, title)
+    with card(key or title or "chart"):
         st.plotly_chart(fig, width="stretch", config={"displayModeBar": False})
 
 
@@ -994,10 +1186,10 @@ def page_live():
                     arr["arrived"] = arr["n"].cumsum()
                     fig = px.line(arr, x="time", y="arrived", line_shape="hv", markers=True,
                                   labels={"arrived": "Checked in", "time": ""})
-                    fig.update_traces(line=dict(width=2, color=BRAND["teal"]), marker=dict(size=6),
+                    fig.update_traces(line=dict(width=2, color=SERIES["members"]), marker=dict(size=8),
                                       hovertemplate="%{x|%H:%M}: %{y} checked in<extra></extra>")
                     _plot(fig, 330, "Arrivals so far")
-            with c2.container(border=True):
+            with c2, card("live_latest"):
                 st.markdown("**Latest arrivals**")
                 latest = ev.sort_values("time", ascending=False).head(12)
                 st.dataframe(pd.DataFrame({
@@ -1046,11 +1238,11 @@ def page_insights():
     long = per.melt(id_vars="date", value_vars=["members", "first_timers"], var_name="who", value_name="n")
     long["who"] = long.who.map({"members": "Members", "first_timers": "First-timers"})
     fig = px.bar(long, x="date", y="n", color="who", barmode="stack",
-                 color_discrete_map={"Members": BRAND["teal"], "First-timers": BRAND["navy"]},
+                 color_discrete_map={"Members": SERIES["members"], "First-timers": SERIES["first_timers"]},
                  category_orders={"who": ["Members", "First-timers"]}, labels={"n": "People", "date": ""})
     fig.update_traces(marker_line_width=0, hovertemplate="%{x|%d %b %Y}: %{y}<extra>%{fullData.name}</extra>")
     fig.add_scatter(x=per.date, y=per.avg4, mode="lines", name="4-service average",
-                    line=dict(color=BRAND["slate"], width=2, dash="dot"), hovertemplate="%{y:.1f}<extra>4-service avg</extra>")
+                    line=dict(color=INK["secondary"], width=2, dash="dot"), hovertemplate="%{y:.1f}<extra>4-service avg</extra>")
     fig.update_layout(bargap=0.25, hovermode="x unified")
     _plot(fig, 360, "Attendance per service")
 
@@ -1058,14 +1250,14 @@ def page_insights():
     with c1:
         ft = pd.DataFrame([m for m in members if m.get("first_visit")])
         if ft.empty:
-            with st.container(border=True):
+            with card("ins_ft_empty"):
                 st.markdown("**First-timers per month**")
                 st.caption("No first-visit dates yet.")
         else:
             ft["month"] = pd.to_datetime(ft.first_visit).dt.to_period("M").dt.to_timestamp()
             by_m = ft.groupby("month").size().rename("n").reset_index()
             fig = px.bar(by_m, x="month", y="n", labels={"n": "First-timers", "month": ""})
-            fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{x|%b %Y}: %{y}<extra></extra>")
+            fig.update_traces(marker_color=SERIES["first_timers"], hovertemplate="%{x|%b %Y}: %{y}<extra></extra>")
             fig.update_layout(bargap=0.3)
             _plot(fig, 300, "First-timers per month")
     with c2:
@@ -1076,7 +1268,7 @@ def page_insights():
             first = m.get("first_visit") or (dates[0] if dates else None)
             if first and any(d > first for d in dates):
                 came_back += 1
-        with st.container(border=True):
+        with card("ins_ft_back"):
             st.markdown("**Did first-timers come back?**")
             a, b = st.columns(2)
             a.metric("First-timers", len(fts))
@@ -1092,7 +1284,7 @@ def page_insights():
     if grp:
         gdf = pd.DataFrame({"group": list(grp), "avg": [v / len(past[-8:]) for v in grp.values()]}).sort_values("avg")
         fig = px.bar(gdf, x="avg", y="group", orientation="h", labels={"avg": "Average per service", "group": ""})
-        fig.update_traces(marker_color=BRAND["teal"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
+        fig.update_traces(marker_color=SERIES["members"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
         _plot(fig, max(220, 36 * len(gdf) + 90), f"Attendance by group (last {len(past[-8:])} services)")
 
 
@@ -1220,7 +1412,7 @@ def page_sql():
     demo_note(store)
     mode, _ = layout_prefs()
     left, right = (st.container(), st.container()) if mode == "Stacked" else st.columns([2, 5])
-    with left.container(border=True):
+    with left, card("sql_tables"):
         st.markdown("**Tables**")
         st.code("members\n  id, full_name, phone,\n  email, group_name, role,\n  status, type,\n  date_joined, first_visit,\n"
                 "  invited_by, follow_up\n\nservices\n  service_date, name\n\nattendance\n"
@@ -1244,7 +1436,7 @@ def page_sql():
         if err:
             st.error(err, icon=":material/error:")
         elif df is not None:
-            with st.container(border=True):
+            with card("sql_result"):
                 st.caption(f"{len(df):,} rows · {secs * 1000:.0f} ms" + (" · first 5,000 shown" if len(df) >= 5000 else ""))
                 st.dataframe(df, hide_index=True, width="stretch", height=min(38 * (len(df) + 1) + 4, 520))
                 st.download_button("Download results (CSV)", df.to_csv(index=False), "query_results.csv", "text/csv",

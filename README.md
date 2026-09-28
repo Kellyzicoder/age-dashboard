@@ -9,15 +9,15 @@ missing and follow up.
 
 | Page | What it does |
 |---|---|
-| Check-in (home) | Ushers tick people as they arrive; ticks from every phone appear for everyone within ~5 seconds. Quick "add first-timer" form. |
-| Follow-up | Priority list of who's been missing: 🟡 **yellow** = 3–4 services missed in a row, 🔴 **red** = 5+ in a row. Red first; download as CSV. |
+| Dashboard (home) | KPI tiles (last service, 4-service average, who needs a call, first-timers this month), where everyone stands (donut), people present over time, needs-follow-up list, and a side panel with notifications, latest check-ins and who to call next. Refreshes every 30 s. |
+| Follow-up & Check-in | **Needs follow-up** tab: 🟡 yellow = 3–4 services missed in a row, 🔴 red = 5+; red first; CSV download. **Check-in** tab: ushers tick people as they arrive; ticks sync to every phone within ~5 s; quick "add first-timer" form. |
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
 | Members | The register (editable), sign-ups from the welcome form to approve, add people, and import the Google Sheets CSV exports. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |
 
-The sidebar has **Layout** controls (side-by-side or stacked panels, names per row on Check-in).
-Light and dark mode follow your device setting. Colours and logo come from the church branding.
+Dark dashboard theme in the church colours (logo greens and gold). Chart colours are checked for colour-blind
+separation and contrast. The sidebar has **Layout** controls (names per row on Check-in, panel stacking).
 
 ## Data
 
