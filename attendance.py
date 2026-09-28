@@ -761,7 +761,7 @@ def page_dashboard():
         last_day = dt.date.fromisoformat(last["date"])
 
         st.html(kpi_row([
-            dict(icon="👥", label=f"Last service · {last_day:%a %d %b}", value=n_last,
+            dict(icon="👥", label=f"Last service · {last_day:%d %b}", value=n_last,
                  foot=_delta(n_last - n_prev if n_prev is not None else None, "",
                              f"vs {dt.date.fromisoformat(prev['date']):%d %b}" if prev else "first service")),
             dict(icon="📈", label="Average · last 4 services", value=f"{avg4:.0f}",
@@ -773,9 +773,9 @@ def page_dashboard():
                        if pending else '<span class="kpi-sub">no sign-ups waiting</span>')),
         ]))
 
-        left, right = st.columns([2.2, 1], gap="medium")
+        left, right = st.container(key="dash_row").columns([2.2, 1], gap="medium")
         with left:
-            a, b = st.columns([1, 1.35], gap="medium")
+            a, b = st.container(key="dash_charts").columns([1, 1.35], gap="medium")
             with a:  # donut: where everyone on the register stands
                 fig = go.Figure(go.Pie(
                     labels=["On track", "Yellow", "Red"], values=[ok, yellow, red], hole=0.72, sort=False,

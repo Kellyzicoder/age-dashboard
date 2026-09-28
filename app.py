@@ -85,6 +85,18 @@ div[class*="st-key-card_"] {background: var(--card); border: 1px solid var(--car
 .feed-ic {width: 28px; height: 28px; flex: none; border-radius: 50%; display: grid; place-items: center;
           background: rgba(255,255,255,.06); font-size: .85rem;}
 .feed-empty {color: var(--ink-3);}
+.dash-table td:nth-child(2), .dash-table td:nth-child(3), .dash-table td:nth-child(4) {white-space: nowrap;}
+
+/* medium screens: stack the side panel under the charts; narrow: stack the two charts too */
+@media (max-width: 1180px) {
+  [data-testid="stHorizontalBlock"]:has(.st-key-dash_charts) {flex-direction: column;}
+  [data-testid="stHorizontalBlock"]:has(.st-key-dash_charts) > [data-testid="stColumn"] {width: 100% !important; flex: 1 1 100% !important; min-width: 100%;}
+}
+@media (max-width: 900px) {
+  .st-key-dash_charts [data-testid="stHorizontalBlock"] {flex-direction: column;}
+  .st-key-dash_charts [data-testid="stColumn"] {width: 100% !important; flex: 1 1 100% !important; min-width: 100%;}
+  .dash-table th:nth-child(4), .dash-table td:nth-child(4) {display: none;}
+}
 </style>
 """)
 
