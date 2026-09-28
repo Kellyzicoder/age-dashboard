@@ -1330,24 +1330,27 @@ def page_insights():
 
 
 # ---------------------------------------------------------------- email report
-def _smtp():
-    try:
-        return st.secrets.get("smtp_user"), st.secrets.get("smtp_password")
-    except Exception:
-        return None, None
+def _mail_cfg() -> dict:
+    import report as R
+
+    def get(k):
+        try:
+            return st.secrets.get(k)
+        except Exception:
+            return None
+    return R.mail_config(get)
 
 
 def send_now_button(store, key: str, label: str = "Email today's report now", full: bool = False):
     """Sends the report straight away to everyone on the list. Returns True if sent."""
     import report as R
-    user, pw = _smtp()
+    cfg = _mail_cfg()
     if st.button(label, key=key, icon=":material/forward_to_inbox:", type="primary" if full else "secondary",
-                 width="stretch", disabled=store.demo or not (user and pw),
-                 help=None if (user and pw) else "Add smtp_user and smtp_password in the app's Secrets first "
-                                                 "(see Reports)."):
+                 width="stretch", disabled=store.demo or not cfg["ready"],
+                 help=None if cfg["ready"] else "Add brevo_api_key in the app's Secrets first (see Reports)."):
         with st.spinner("Sending…"):
             try:
-                out = R.send(store, user, pw, kind="manual")
+                out = R.send(store, cfg, kind="manual")
                 st.toast(f"Report sent to {', '.join(out['to'])}", icon=":material/mark_email_read:")
                 return True
             except Exception as e:
@@ -1356,21 +1359,22 @@ def send_now_button(store, key: str, label: str = "Email today's report now", fu
 
 
 REPORT_SETUP = """
-**One-time setup (about 5 minutes)**
+**One-time setup (about 5 minutes)** — the report is sent through **Brevo**, a free email service (300 emails a day).
 
-1. **Gmail app password** — sign in to the church Gmail that will *send* the report (e.g. greaterloveauckland@gmail.com)
-   → **Google Account → Security → 2-Step Verification** (turn it on if it's off) → **App passwords** →
-   create one called *FCC Attendance*. Google shows a 16-letter password once — copy it.
-2. **This app** — share.streamlit.io → *fcc-attendance* → ⋮ → **Settings → Secrets**, add two lines:
+1. **Brevo account** — go to **brevo.com** → *Sign up free* using the church email (greaterloveauckland@gmail.com)
+   and confirm the email Brevo sends you. That address becomes the verified *sender*.
+2. **API key** — in Brevo, click your name (top right) → **SMTP & API** → **API Keys** tab → **Generate a new API key**,
+   name it *FCC Attendance*, and copy it (it starts with `xkeysib-`).
+3. **This app** — share.streamlit.io → *fcc-attendance* → ⋮ → **Settings → Secrets**, add:
    ```toml
-   smtp_user = "greaterloveauckland@gmail.com"
-   smtp_password = "the 16-letter app password"
+   brevo_api_key = "xkeysib-…"
+   report_sender = "greaterloveauckland@gmail.com"
    ```
-3. **The 5pm schedule** — github.com/Kellyzicoder/fcc-attendance → **Settings → Secrets and variables → Actions →
-   New repository secret**, add three: `DATABASE_URL` (same as in the app's Secrets), `SMTP_USER`, `SMTP_PASSWORD`.
+4. **The 5pm schedule** — github.com/Kellyzicoder/fcc-attendance → **Settings → Secrets and variables → Actions →
+   New repository secret**, add: `DATABASE_URL` (same as in the app's Secrets), `BREVO_API_KEY`, `REPORT_SENDER`.
 
-Then press **Send report now** below to test. The daily email goes out between 4:40 and 5pm NZ time; if it ever fails,
-GitHub emails the repo owner, and later attempts that evening keep trying.
+Then press **Send report now** above to test. The first one may land in *Spam* — mark it *Not spam* once.
+The daily email goes out between 4:40 and 5pm NZ time; if it ever fails, GitHub emails the repo owner.
 """
 
 
@@ -1382,14 +1386,14 @@ def page_reports():
     if not gate(store):
         return
     demo_note(store)
-    user, pw = _smtp()
+    cfg = _mail_cfg()
     left, right = st.columns([1, 1.4], gap="medium")
     with left:
         with card("rep_send"):
             st.markdown("**Send the report**")
             st.caption("Goes out automatically every day by 5pm (NZ). Use this to send the latest numbers any time — "
                        "e.g. straight after the service, before 6pm.")
-            if not (user and pw):
+            if not cfg["ready"]:
                 st.warning("Email isn't set up yet — see the steps below.", icon=":material/settings:")
             send_now_button(store, "rep_send_now", "Send report now", full=True)
         with card("rep_to"):
@@ -1416,7 +1420,7 @@ def page_reports():
                     "Type": ["5pm (automatic)" if h["kind"] == "daily" else "Sent from the app" for h in hist],
                     "": ["✅ Sent" if h["ok"] else "❌ Failed" for h in hist],
                     "Details": [h["detail"] for h in hist]}), hide_index=True, width="stretch")
-        with st.expander("Set up email sending", icon=":material/settings:", expanded=not (user and pw)):
+        with st.expander("Set up email sending", icon=":material/settings:", expanded=not cfg["ready"]):
             st.markdown(REPORT_SETUP)
     with right, card("rep_preview"):
         r = R.build(store)

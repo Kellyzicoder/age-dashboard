@@ -29,8 +29,9 @@ check-ins, who needs a follow-up call (with phone numbers), new welcome-form sig
 - Scheduled by `.github/workflows/daily-report.yml` (GitHub Actions). Cron is UTC, so it tries several times across
   NZST/NZDT; `scripts/daily_report.py` sends on the first run after 4:40pm NZ and logs it in `email_log`, so later
   runs that evening skip. A failed run makes GitHub email the repo owner.
-- Sent through Gmail with an app password. Secrets: in the app `smtp_user`, `smtp_password`; in GitHub Actions
-  `DATABASE_URL`, `SMTP_USER`, `SMTP_PASSWORD`.
+- Sent through Brevo's free email API (300/day). Secrets: in the app `brevo_api_key`, `report_sender`; in GitHub
+  Actions `DATABASE_URL`, `BREVO_API_KEY`, `REPORT_SENDER`. (A Gmail app password via `smtp_user`/`smtp_password`
+  also works as a fallback.)
 - Leaders can also press **Send report now** (Dashboard or Reports) any time, e.g. right after a service.
 
 ## Data
