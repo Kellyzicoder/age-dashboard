@@ -66,7 +66,13 @@ SCHEMA = [
         member_id TEXT NOT NULL REFERENCES members(id) ON DELETE CASCADE,
         checked_at TEXT, PRIMARY KEY (service_date, member_id))""",
     "CREATE INDEX IF NOT EXISTS attendance_member ON attendance(member_id)",
+    "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
+    """CREATE TABLE IF NOT EXISTS email_log (
+        id TEXT PRIMARY KEY, kind TEXT, report_date DATE, sent_at TEXT, recipients TEXT, ok BOOLEAN, detail TEXT)""",
 ]
+# Postgres only: lock the app's tables so the public (publishable) key used by the welcome form can't read them.
+PG_SECURITY = [f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"
+               for t in ("members", "services", "attendance", "settings", "email_log")]
 # Sign-ups from the public welcome form. On Postgres this table is created by the setup SQL (Members → Setup),
 # because it needs Row Level Security and a UUID default; here it only exists for the SQLite demo.
 DEMO_REGISTRATIONS = """CREATE TABLE IF NOT EXISTS registrations (
@@ -130,6 +136,15 @@ class SqlStore:
         if not self._schema_ready:
             for stmt in SCHEMA + ([DEMO_REGISTRATIONS] if self.demo else []):
                 self._raw(stmt)
+            if not self.demo:
+                import psycopg
+                for stmt in PG_SECURITY:  # best effort: never block the app if the role can't alter a table
+                    try:
+                        self._raw(stmt)
+                    except psycopg.OperationalError:
+                        raise
+                    except Exception:
+                        pass
             self._schema_ready = True
 
     def retry_in(self) -> int:
@@ -345,6 +360,30 @@ class SqlStore:
             self.set_present(visit, mid, True)
         self.resolve_registration(reg["id"], "approved", mid)
         return mid
+
+    # -- settings & email log (daily report)
+    def get_setting(self, key: str, default: str = "") -> str:
+        rows = self._exec("SELECT value FROM settings WHERE key = ?", (key,), fetch=True)
+        return rows[0]["value"] if rows and rows[0]["value"] is not None else default
+
+    def set_setting(self, key: str, value: str):
+        self._exec("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT (key) DO UPDATE SET value = excluded.value",
+                   (key, value))
+
+    def log_email(self, kind: str, report_date: str, recipients: list[str], ok: bool, detail: str = ""):
+        self._exec("INSERT INTO email_log (id, kind, report_date, sent_at, recipients, ok, detail) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?)", (new_id(), kind, report_date, now_iso(), ", ".join(recipients), ok,
+                                                    detail[:500]))
+
+    def sent_on(self, report_date: str, kind: str = "daily") -> bool:
+        rows = self._exec("SELECT COUNT(*) AS n FROM email_log WHERE report_date = ? AND kind = ? AND ok = ?",
+                          (report_date, kind, True), fetch=True)
+        return bool(rows and rows[0]["n"])
+
+    def email_history(self, limit: int = 15) -> list[dict]:
+        rows = self._exec("SELECT kind, report_date, sent_at, recipients, ok, detail FROM email_log "
+                          "ORDER BY sent_at DESC LIMIT ?", (limit,), fetch=True)
+        return [{k: _txt(v) if k != "ok" else bool(v) for k, v in r.items()} for r in rows]
 
     # -- read-only SQL for the query page
     def run_query(self, sql: str, limit: int = 5000) -> pd.DataFrame:
@@ -841,6 +880,7 @@ def page_dashboard():
             call = [] if df.empty else [
                 ("📞", f"{_esc(r.name)}", f"{r.phone or 'no phone'} · {r.missed} missed")
                 for r in df[df.level == "red"].head(5).itertuples()]
+            send_now_button(store, "dash_send_now")
             st.html(feed("Notifications", notes, "All caught up")
                     + feed("Latest check-ins" + ("" if here else f" · {last_day:%d %b}"), act, "No check-ins yet")
                     + feed("Call next", call, "No one in red — great!"))
@@ -1286,6 +1326,106 @@ def page_insights():
         fig = px.bar(gdf, x="avg", y="group", orientation="h", labels={"avg": "Average per service", "group": ""})
         fig.update_traces(marker_color=SERIES["members"], hovertemplate="%{y}: %{x:.1f} per service<extra></extra>")
         _plot(fig, max(220, 36 * len(gdf) + 90), f"Attendance by group (last {len(past[-8:])} services)")
+
+
+
+# ---------------------------------------------------------------- email report
+def _smtp():
+    try:
+        return st.secrets.get("smtp_user"), st.secrets.get("smtp_password")
+    except Exception:
+        return None, None
+
+
+def send_now_button(store, key: str, label: str = "Email today's report now", full: bool = False):
+    """Sends the report straight away to everyone on the list. Returns True if sent."""
+    import report as R
+    user, pw = _smtp()
+    if st.button(label, key=key, icon=":material/forward_to_inbox:", type="primary" if full else "secondary",
+                 width="stretch", disabled=store.demo or not (user and pw),
+                 help=None if (user and pw) else "Add smtp_user and smtp_password in the app's Secrets first "
+                                                 "(see Reports)."):
+        with st.spinner("Sending…"):
+            try:
+                out = R.send(store, user, pw, kind="manual")
+                st.toast(f"Report sent to {', '.join(out['to'])}", icon=":material/mark_email_read:")
+                return True
+            except Exception as e:
+                st.error(f"Couldn't send the email: {e}", icon=":material/error:")
+    return False
+
+
+REPORT_SETUP = """
+**One-time setup (about 5 minutes)**
+
+1. **Gmail app password** — sign in to the church Gmail that will *send* the report (e.g. greaterloveauckland@gmail.com)
+   → **Google Account → Security → 2-Step Verification** (turn it on if it's off) → **App passwords** →
+   create one called *FCC Attendance*. Google shows a 16-letter password once — copy it.
+2. **This app** — share.streamlit.io → *fcc-attendance* → ⋮ → **Settings → Secrets**, add two lines:
+   ```toml
+   smtp_user = "greaterloveauckland@gmail.com"
+   smtp_password = "the 16-letter app password"
+   ```
+3. **The 5pm schedule** — github.com/Kellyzicoder/fcc-attendance → **Settings → Secrets and variables → Actions →
+   New repository secret**, add three: `DATABASE_URL` (same as in the app's Secrets), `SMTP_USER`, `SMTP_PASSWORD`.
+
+Then press **Send report now** below to test. The daily email goes out between 4:40 and 5pm NZ time; if it ever fails,
+GitHub emails the repo owner, and later attempts that evening keep trying.
+"""
+
+
+@db_safe
+def page_reports():
+    import report as R
+    store = get_store()
+    header("Reports", "The 5pm email to church leaders — who gets it, what's in it, and send it now", store)
+    if not gate(store):
+        return
+    demo_note(store)
+    user, pw = _smtp()
+    left, right = st.columns([1, 1.4], gap="medium")
+    with left:
+        with card("rep_send"):
+            st.markdown("**Send the report**")
+            st.caption("Goes out automatically every day by 5pm (NZ). Use this to send the latest numbers any time — "
+                       "e.g. straight after the service, before 6pm.")
+            if not (user and pw):
+                st.warning("Email isn't set up yet — see the steps below.", icon=":material/settings:")
+            send_now_button(store, "rep_send_now", "Send report now", full=True)
+        with card("rep_to"):
+            st.markdown("**Who gets it**")
+            current = R.recipients(store)
+            text = st.text_area("Email addresses (one per line)", "\n".join(current), height=130, key="rep_to_text",
+                                disabled=store.demo)
+            if st.button("Save recipients", key="rep_save", icon=":material/save:", disabled=store.demo):
+                good, bad = R.save_recipients(store, text)
+                if bad:
+                    st.error("Not saved — these don't look like email addresses: " + ", ".join(bad))
+                elif good:
+                    st.success(f"Saved {len(good)} recipient{'s' if len(good) != 1 else ''}.")
+                else:
+                    st.error("Add at least one email address.")
+        with card("rep_log"):
+            st.markdown("**Recent emails**")
+            hist = store.email_history(10)
+            if not hist:
+                st.caption("Nothing sent yet.")
+            else:
+                st.dataframe(pd.DataFrame({
+                    "Sent": _parse_times([h["sent_at"] for h in hist]).dt.strftime("%a %d %b %H:%M"),
+                    "Type": ["5pm (automatic)" if h["kind"] == "daily" else "Sent from the app" for h in hist],
+                    "": ["✅ Sent" if h["ok"] else "❌ Failed" for h in hist],
+                    "Details": [h["detail"] for h in hist]}), hide_index=True, width="stretch")
+        with st.expander("Set up email sending", icon=":material/settings:", expanded=not (user and pw)):
+            st.markdown(REPORT_SETUP)
+    with right, card("rep_preview"):
+        r = R.build(store)
+        st.markdown(f"**Preview** · {r['subject']}")
+        import streamlit.components.v1 as components
+        components.html(r["html"], height=900, scrolling=True)
+        st.download_button("Download the Excel attachment", r["xlsx"], r["filename"],
+                           "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+                           icon=":material/table_view:")
 
 
 REGISTRATIONS_SQL = """-- Sign-ups from the FCC welcome form. Safe to run more than once.

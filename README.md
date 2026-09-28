@@ -14,10 +14,24 @@ missing and follow up.
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
 | Members | The register (editable), sign-ups from the welcome form to approve, add people, and import the Google Sheets CSV exports. |
+| Reports | The daily email to leaders: who gets it (add or remove addresses), a live preview, **Send report now**, the Excel attachment, and a log of every email sent. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |
 
 Dark dashboard theme in the church colours (logo greens and gold). Chart colours are checked for colour-blind
 separation and contrast. The sidebar has **Layout** controls (names per row on Check-in, panel stacking).
+
+## Daily email
+
+Every day by 5pm (NZ) a summary goes to the addresses on the Reports page (default greaterloveauckland@gmail.com):
+check-ins, who needs a follow-up call (with phone numbers), new welcome-form sign-ups, plus an Excel workbook
+(Checked in · Follow-up · Sign-ups · Services) that opens in Excel or Google Sheets.
+
+- Scheduled by `.github/workflows/daily-report.yml` (GitHub Actions). Cron is UTC, so it tries several times across
+  NZST/NZDT; `scripts/daily_report.py` sends on the first run after 4:40pm NZ and logs it in `email_log`, so later
+  runs that evening skip. A failed run makes GitHub email the repo owner.
+- Sent through Gmail with an app password. Secrets: in the app `smtp_user`, `smtp_password`; in GitHub Actions
+  `DATABASE_URL`, `SMTP_USER`, `SMTP_PASSWORD`.
+- Leaders can also press **Send report now** (Dashboard or Reports) any time, e.g. right after a service.
 
 ## Data
 
@@ -26,6 +40,7 @@ Stored in a **Postgres** database (Supabase) — never in this repo. Tables:
 - `members` — id, full_name, phone, email, group_name, role, status, type (member / first_timer), date_joined, first_visit, invited_by, follow_up
 - `services` — service_date, name
 - `attendance` — service_date, member_id, checked_at (one row per person ticked per service)
+- `settings`, `email_log` — report recipients and a record of every email sent
 - `registrations` — sign-ups from the [welcome form](https://github.com/Kellyzicoder/fcc-welcome), approved under *Members → Sign-ups*
 
 Until `database_url` is set in the app's Streamlit **Secrets**, the pages run on a SQLite demo database with invented

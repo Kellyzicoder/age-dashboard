@@ -1,6 +1,6 @@
 """FCC Attendance Tracker — Streamlit app for Favourite Child Church.
 
-Pages (sidebar): Dashboard (home) · Follow-up & Check-in · Live · Insights · Members · SQL.
+Pages (sidebar): Dashboard (home) · Follow-up & Check-in · Live · Insights · Members · Reports · SQL.
 All data lives in Postgres (Supabase) via `database_url` in Streamlit secrets; see attendance.py.
 """
 from pathlib import Path
@@ -106,10 +106,13 @@ import attendance as A  # noqa: E402
 
 # Streamlit Cloud pulls new code on every push, but an already-imported module can stay in memory.
 # Reload attendance.py whenever the file on disk is newer than the copy we're running.
-_mtime = Path(A.__file__).stat().st_mtime
-if getattr(A, "_loaded_mtime", None) not in (None, _mtime):
+import report as R  # noqa: E402
+
+_stamp = tuple(Path(m.__file__).stat().st_mtime for m in (A, R))
+if getattr(A, "_loaded_stamp", None) not in (None, _stamp):
     A = importlib.reload(A)
-A._loaded_mtime = _mtime
+    R = importlib.reload(R)  # report.py uses attendance.py, so reload it after
+A._loaded_stamp = _stamp
 
 pg = st.navigation({
     "Attendance": [
@@ -121,6 +124,7 @@ pg = st.navigation({
     ],
     "Admin": [
         st.Page(A.page_members, title="Members", icon=":material/badge:", url_path="members"),
+        st.Page(A.page_reports, title="Reports", icon=":material/forward_to_inbox:", url_path="reports"),
         st.Page(A.page_sql, title="SQL", icon=":material/database:", url_path="sql"),
     ],
 })
