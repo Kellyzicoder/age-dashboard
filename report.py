@@ -4,8 +4,8 @@ Used in two places:
   • scripts/daily_report.py — run by GitHub Actions every evening (the 5pm report);
   • the app's "Send report now" button.
 
-Sending needs a Gmail address and an *app password* (Google Account → Security → 2-Step Verification →
-App passwords). Recipients are stored in the database (settings table) and edited in the app.
+Sending goes through Brevo's free email API (an API key, no Google settings); a Gmail app password also works as a
+fallback. Recipients are stored in the database (settings table) and edited in the app.
 """
 from __future__ import annotations
 
@@ -73,7 +73,7 @@ def gather(store, day: dt.date | None = None) -> dict:
     df = A.missed_streaks(members, services, day)
     follow = [] if df.empty else [
         dict(Status="Red" if r.level == "red" else "Yellow", Name=r.name, **{"Missed in a row": int(r.missed)},
-             **{"Last seen": pd.to_datetime(r.last_seen).strftime("%d %b %Y") if r.last_seen else "Not yet"},
+             **{"Last seen": A.fmt_date(r.last_seen, "%d %b %Y")},
              Phone=r.phone, Group=r.group, **{"Invited by": r.invited_by})
         for r in df[df.level != "ok"].itertuples()]
 
@@ -203,7 +203,7 @@ def build(store, day: dt.date | None = None) -> dict:
         f'<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">{tiles}'
         f"</table></td></tr>"
         + _section(f"Needs a follow-up call ({need})" + (f" · {d['red']} red, {d['yellow']} yellow" if need else ""),
-                   _table([{**f, "Last seen": f["Last seen"][:6], "Missed": f["Missed in a row"]} for f in d["follow"]],
+                   _table([{**f, "Last seen": f["Last seen"] if f["Last seen"] == "Not yet" else f["Last seen"][:6], "Missed": f["Missed in a row"]} for f in d["follow"]],
                           ["Status", "Name", "Missed", "Last seen", "Phone"],
                           "Nobody has missed 3 or more services in a row."))
         + _section(f"Welcome-form sign-ups waiting ({len(d['signups'])})",
@@ -228,21 +228,55 @@ def build(store, day: dt.date | None = None) -> dict:
 
 
 # ---------------------------------------------------------------- send
-def send(store, smtp_user: str, smtp_password: str, to: list[str] | None = None, kind: str = "manual",
-         day: dt.date | None = None, host: str = "smtp.gmail.com", port: int = 465) -> dict:
-    """Build and send the report. Logs every attempt (so the 5pm job never double-sends). Raises on failure."""
-    to = to or recipients(store)
-    r = build(store, day)
+def mail_config(get) -> dict:
+    """Read sending settings with get(name) (st.secrets.get or os.environ.get). Brevo preferred, Gmail as fallback."""
+    cfg = dict(brevo_api_key=get("brevo_api_key") or get("BREVO_API_KEY"),
+               sender=get("report_sender") or get("REPORT_SENDER") or DEFAULT_TO[0],
+               smtp_user=get("smtp_user") or get("SMTP_USER"), smtp_password=get("smtp_password") or get("SMTP_PASSWORD"))
+    cfg["ready"] = bool(cfg["brevo_api_key"] or (cfg["smtp_user"] and cfg["smtp_password"]))
+    return cfg
+
+
+def _send_brevo(cfg: dict, to: list[str], r: dict):
+    """Brevo transactional email API (free: 300 emails/day). The sender address must be verified in Brevo."""
+    import base64
+    import json
+    import urllib.error
+    import urllib.request
+    payload = dict(sender=dict(name="FCC Attendance", email=cfg["sender"]), to=[dict(email=e) for e in to],
+                   subject=r["subject"], htmlContent=r["html"], textContent=r["text"],
+                   attachment=[dict(name=r["filename"], content=base64.b64encode(r["xlsx"]).decode())])
+    req = urllib.request.Request("https://api.brevo.com/v3/smtp/email", data=json.dumps(payload).encode(),
+                                 headers={"api-key": cfg["brevo_api_key"], "content-type": "application/json",
+                                          "accept": "application/json"}, method="POST")
+    try:
+        with urllib.request.urlopen(req, timeout=30) as resp:
+            resp.read()
+    except urllib.error.HTTPError as e:  # surface Brevo's own message (e.g. "sender not valid")
+        detail = e.read().decode(errors="replace")[:300]
+        raise RuntimeError(f"Brevo said {e.code}: {detail}") from None
+
+
+def _send_smtp(cfg: dict, to: list[str], r: dict, host: str = "smtp.gmail.com", port: int = 465):
     msg = EmailMessage()
-    msg["Subject"], msg["From"], msg["To"] = r["subject"], f"FCC Attendance <{smtp_user}>", ", ".join(to)
+    msg["Subject"], msg["From"], msg["To"] = r["subject"], f"FCC Attendance <{cfg['smtp_user']}>", ", ".join(to)
     msg.set_content(r["text"])
     msg.add_alternative(r["html"], subtype="html")
     msg.add_attachment(r["xlsx"], maintype="application",
                        subtype="vnd.openxmlformats-officedocument.spreadsheetml.sheet", filename=r["filename"])
+    with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as s:
+        s.login(cfg["smtp_user"], cfg["smtp_password"])
+        s.send_message(msg)
+
+
+def send(store, cfg: dict, to: list[str] | None = None, kind: str = "manual", day: dt.date | None = None) -> dict:
+    """Build and send the report. Logs every attempt (so the 5pm job never double-sends). Raises on failure."""
+    if not cfg.get("ready"):
+        raise RuntimeError("Email sending isn't set up yet (add brevo_api_key to the Secrets).")
+    to = to or recipients(store)
+    r = build(store, day)
     try:
-        with smtplib.SMTP_SSL(host, port, context=ssl.create_default_context(), timeout=30) as s:
-            s.login(smtp_user, smtp_password)
-            s.send_message(msg)
+        (_send_brevo if cfg.get("brevo_api_key") else _send_smtp)(cfg, to, r)
     except Exception as e:
         store.log_email(kind, r["day"].isoformat(), to, False, f"{type(e).__name__}: {e}")
         raise
