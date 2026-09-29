@@ -121,6 +121,7 @@ class SqlStore:
         self._lock = threading.RLock()
         self._conn = None
         self._cache = {}
+        self._wrote = {}  # service date -> time of the last tick/untick, so a poll never shows an older read
         self._schema_ready = False
         self._down_until = 0.0
         self._backoff = 0.0
@@ -252,7 +253,19 @@ class SqlStore:
             return list(svcs.values())
         return self._cached("services", 15, load)
 
-    def get_service(self, date: str):  # live-poll read: small and always fresh
+    def get_service(self, date: str, max_age: float = 2.0):
+        """Live-poll read. Shared by every open phone for `max_age` seconds, so ten ushers polling cost one query,
+        but a result is never reused if someone ticked after it was read."""
+        import time
+        key, now = f"svc:{date}", time.time()
+        hit = self._cache.get(key)
+        if hit and now - hit[0] < max_age and hit[0] >= self._wrote.get(date, 0.0):
+            return hit[1]
+        val = self._load_service(date)
+        self._cache[key] = (now, val)
+        return val
+
+    def _load_service(self, date: str):
         rows = self._exec("SELECT a.member_id, a.checked_at, s.name FROM services s "
                           "LEFT JOIN attendance a ON a.service_date = s.service_date WHERE s.service_date = ?",
                           (date,), fetch=True)
@@ -265,7 +278,7 @@ class SqlStore:
     def ensure_service(self, date: str, name: str):
         self._exec("INSERT INTO services (service_date, name) VALUES (?, ?) "
                    "ON CONFLICT (service_date) DO UPDATE SET name = excluded.name", (date, name or "Service"))
-        self._cache.pop("services", None)
+        self._touched(date)
 
     def set_present(self, date: str, mid: str, present: bool, name: str = "Sunday Service"):
         if present:
@@ -275,7 +288,13 @@ class SqlStore:
                        "ON CONFLICT (service_date, member_id) DO NOTHING", (date, mid, now_iso()))
         else:
             self._exec("DELETE FROM attendance WHERE service_date = ? AND member_id = ?", (date, mid))
+        self._touched(date)
+
+    def _touched(self, date: str):
+        import time
+        self._wrote[date] = time.time()
         self._cache.pop("services", None)
+        self._cache.pop(f"svc:{date}", None)
 
     def upsert_members(self, rows: list[dict]):
         existing = {r["id"] for r in self._exec("SELECT id FROM members", fetch=True)}
@@ -624,27 +643,70 @@ def header(title: str, subtitle: str, store, live: bool = False):
     st.html(hero_html("Favourite Child Church · Attendance", title, subtitle, chips, live))
 
 
-def gate(store) -> bool:
-    """Real member data needs a password (set attendance_password in secrets). Demo data is open."""
+def _secret(name: str) -> str:
+    try:
+        return st.secrets.get(name) or ""
+    except Exception:
+        return ""
+
+
+def role(store) -> str:
+    """'admin', 'team' or '' (not signed in). Demo data is open to everyone as admin.
+
+    Two passwords in Secrets: `attendance_password` for the team (dashboard, check-in, follow-up, live, insights)
+    and `admin_password` for the Admin pages (members, sign-ups, reports, SQL). Without `admin_password`,
+    the team password opens everything, as before.
+    """
+    if store.demo:
+        return "admin"
+    r = st.session_state.get("role", "")
+    if r == "team" and not _secret("admin_password"):
+        return "admin"
+    return r
+
+
+def is_admin(store) -> bool:
+    return role(store) == "admin"
+
+
+def gate(store, admin: bool = False) -> bool:
+    """Sign-in check at the top of every page. admin=True also requires the admin password."""
     if store.demo:
         return True
-    try:
-        pw = st.secrets.get("attendance_password")
-    except Exception:
-        pw = None
-    if not pw:
+    team_pw, admin_pw = _secret("attendance_password"), _secret("admin_password")
+    if not team_pw:
         st.error("Set `attendance_password` in the app's Secrets before real member data can be shown.")
         return False
-    if st.session_state.get("att_ok"):
+    r = role(store)
+    if r == "admin" or (r == "team" and not admin):
         return True
+    if r == "team":
+        st.warning("This page is for admins. Sign out and sign in with the admin password to use it.",
+                   icon=":material/lock:")
+        return False
     with st.form("att_login"):
-        entered = st.text_input("Attendance password", type="password")
-        if st.form_submit_button("Unlock", type="primary"):
-            if entered == pw:
-                st.session_state.att_ok = True
+        entered = st.text_input("Password", type="password")
+        if st.form_submit_button("Sign in", type="primary"):
+            if admin_pw and entered == admin_pw:
+                st.session_state.role = "admin"
+                st.rerun()
+            if entered == team_pw:
+                st.session_state.role = "team"
                 st.rerun()
             st.error("Wrong password.")
     return False
+
+
+def account_box(store):
+    """Sidebar: who is signed in, and a sign-out button."""
+    if store.demo or not role(store):
+        return
+    with st.sidebar:
+        label = "Admin" if is_admin(store) else "Team"
+        st.caption(f"Signed in · {label}")
+        if st.button("Sign out", icon=":material/logout:", key="sign_out"):
+            st.session_state.pop("role", None)
+            st.rerun()
 
 
 def layout_prefs(names: bool = False):
@@ -682,7 +744,7 @@ def checkin_panel(store):
         except DbUnavailable:
             st.toast("Not saved — can't reach the database right now.", icon=":material/cloud_off:")
 
-    @st.fragment(run_every=5)
+    @st.fragment(run_every=3)
     @db_safe
     def live_list():
         s = store.get_service(date) or {}
@@ -694,7 +756,7 @@ def checkin_panel(store):
         k[2].metric("First-timers today", f"{sum(1 for m in members if m['id'] in present and m.get('type') == 'first_timer')}",
                     border=True)
         with card("ci_list"):
-            st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · showing {len(shown)} of {len(members)}")
+            st.caption(f"Live · ticks from other phones appear within a few seconds · showing {len(shown)} of {len(members)}")
             cols = st.columns(per_row)
             for i, m in enumerate(shown):
                 key = f"ci_{date}_{m['id']}"
@@ -702,7 +764,8 @@ def checkin_panel(store):
                 tag = " · first-timer" if m.get("type") == "first_timer" else ""
                 cols[i % per_row].checkbox(f"{m['full_name']}{tag}", key=key, on_change=on_tick, args=(m["id"],))
 
-    live_list()
+    with st.container(key="live_ci"):  # refreshes quietly (see app.py CSS)
+        live_list()
 
     with st.expander("Add a first-timer and check them in", icon=":material/person_add:"):
         with st.form("ft_add", clear_on_submit=True):
@@ -892,7 +955,8 @@ def page_dashboard():
                     + feed("Call next", call, "No one in red — great!"))
         st.caption(f"Updated {dt.datetime.now(TZ):%H:%M:%S}")
 
-    body()
+    with st.container(key="live_dash"):  # refreshes quietly (see app.py CSS)
+        body()
 
 
 @db_safe
@@ -965,7 +1029,8 @@ def followup_panel(store):
         st.caption(f"Live · recalculated {dt.datetime.now(TZ):%H:%M:%S} · only services since someone joined "
                    "or first visited count against them.")
 
-    live_followup()
+    with st.container(key="live_fu"):  # refreshes quietly (see app.py CSS)
+        live_followup()
 
 
 EDIT_COLS = ["full_name", "type", "phone", "email", "group", "role", "status", "date_joined", "first_visit",
@@ -1054,7 +1119,7 @@ def register_editor(store):
 def page_members():
     store = get_store()
     header("Members", "Your register and first-timers, stored in the database", store)
-    if not gate(store):
+    if not gate(store, admin=True):
         return
     demo_note(store)
     pending = store.count_pending()
@@ -1245,7 +1310,8 @@ def page_live():
                     hide_index=True, width="stretch", height=min(38 * (len(latest) + 1) + 4, 480))
         st.caption(f"Live · updated {dt.datetime.now(TZ):%H:%M:%S} · refreshing every {every}s")
 
-    live_body()
+    with st.container(key="live_page"):  # refreshes quietly (see app.py CSS)
+        live_body()
 
 
 @db_safe
@@ -1389,7 +1455,7 @@ def page_reports():
     import report as R
     store = get_store()
     header("Reports", "The 5pm email to church leaders — who gets it, what's in it, and send it now", store)
-    if not gate(store):
+    if not gate(store, admin=True):
         return
     demo_note(store)
     cfg = _mail_cfg()
@@ -1482,7 +1548,8 @@ SETUP_GUIDE = """
 **Then, on share.streamlit.io** → your app → ⋮ → *Settings → Secrets*, paste:
 
 ```toml
-attendance_password = "choose-a-strong-password"
+attendance_password = "password-for-the-team"
+admin_password = "a-different-password-for-admins"
 database_url = "postgresql://…your connection string…?sslmode=require"
 ```
 Save — the app restarts, creates its three tables, and switches from demo to your database.
@@ -1557,7 +1624,7 @@ ORDER BY first_timers DESC""",
 def page_sql():
     store = get_store()
     header("SQL", "Ask the database anything — read-only, so nothing can be changed from here", store)
-    if not gate(store):
+    if not gate(store, admin=True):
         return
     demo_note(store)
     mode, _ = layout_prefs()

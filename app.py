@@ -1,6 +1,6 @@
 """FCC Attendance Tracker — Streamlit app for Favourite Child Church.
 
-Pages (sidebar): Dashboard (home) · Follow-up & Check-in · Live · Insights · Members · Reports · SQL.
+Pages (sidebar): Dashboard (home) · Follow-up & Check-in · Live · Insights; admins also get Members · Reports · SQL.
 All data lives in Postgres (Supabase) via `database_url` in Streamlit secrets; see attendance.py.
 """
 from pathlib import Path
@@ -25,6 +25,10 @@ html, body, .stApp, .stMarkdown, [data-testid="stMetric"], [data-testid="stSideb
 [data-testid="stHeader"] {background: transparent; box-shadow: none;}
 [data-testid="stDecoration"] {display: none;}
 [data-testid="stSidebar"] {border-right: 1px solid var(--card-line);}
+
+/* live panels re-check the database every few seconds in the background: don't fade them while they do */
+div[class*="st-key-live_"] [data-testid="stElementContainer"], div[class*="st-key-live_"] [data-stale] {
+       opacity: 1 !important; transition: none !important;}
 
 /* cards: every bordered container made with card() */
 div[class*="st-key-card_"] {background: var(--card); border: 1px solid var(--card-line) !important;
@@ -117,6 +121,12 @@ if getattr(A, "_loaded_stamp", None) not in (None, _stamp):
     R = importlib.reload(R)  # report.py uses attendance.py, so reload it after
 A._loaded_stamp = _stamp
 
+store = A.get_store()
+admin_pages = [
+    st.Page(A.page_members, title="Members", icon=":material/badge:", url_path="members"),
+    st.Page(A.page_reports, title="Reports", icon=":material/forward_to_inbox:", url_path="reports"),
+    st.Page(A.page_sql, title="SQL", icon=":material/database:", url_path="sql"),
+]
 pg = st.navigation({
     "Attendance": [
         st.Page(A.page_dashboard, title="Dashboard", icon=":material/space_dashboard:", url_path="dashboard",
@@ -125,10 +135,8 @@ pg = st.navigation({
         st.Page(A.page_live, title="Live", icon=":material/sensors:", url_path="live"),
         st.Page(A.page_insights, title="Insights", icon=":material/insights:", url_path="insights"),
     ],
-    "Admin": [
-        st.Page(A.page_members, title="Members", icon=":material/badge:", url_path="members"),
-        st.Page(A.page_reports, title="Reports", icon=":material/forward_to_inbox:", url_path="reports"),
-        st.Page(A.page_sql, title="SQL", icon=":material/database:", url_path="sql"),
-    ],
+    # Admin pages only appear for people signed in with the admin password (see A.role)
+    **({"Admin": admin_pages} if A.is_admin(store) else {}),
 })
+A.account_box(store)
 pg.run()

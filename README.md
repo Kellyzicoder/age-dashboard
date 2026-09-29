@@ -10,12 +10,20 @@ missing and follow up.
 | Page | What it does |
 |---|---|
 | Dashboard (home) | KPI tiles (last service, 4-service average, who needs a call, first-timers this month), where everyone stands (donut), people present over time, needs-follow-up list, and a side panel with notifications, latest check-ins and who to call next. Refreshes every 30 s. |
-| Follow-up & Check-in | **Needs follow-up** tab: 🟡 yellow = 3–4 services missed in a row, 🔴 red = 5+; red first; CSV download. **Check-in** tab: ushers tick people as they arrive; ticks sync to every phone within ~5 s; quick "add first-timer" form. |
+| Follow-up & Check-in | **Needs follow-up** tab: 🟡 yellow = 3–4 services missed in a row, 🔴 red = 5+; red first; CSV download. **Check-in** tab: ushers tick people as they arrive; ticks sync to every phone within ~3 s, and the list updates quietly without flashing; quick "add first-timer" form. |
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
 | Members | The register (editable), sign-ups from the welcome form to approve, add people, and import the Google Sheets CSV exports. |
 | Reports | The daily email to leaders: who gets it (add or remove addresses), a live preview, **Send report now**, the Excel attachment, and a log of every email sent. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |
+
+**Who sees what.** Two passwords, set in the app's Secrets:
+
+- `attendance_password`: the team (ushers, leaders). Opens Dashboard, Follow-up & Check-in, Live and Insights.
+- `admin_password`: admins only. Also shows the **Admin** section (Members, Reports, SQL). People signed in with the
+  team password don't see it at all. If `admin_password` isn't set, the team password opens everything.
+
+The sidebar shows who is signed in and has a **Sign out** button.
 
 Dark dashboard theme in the church colours (logo greens and gold). Chart colours are checked for colour-blind
 separation and contrast. The sidebar has **Layout** controls (names per row on Check-in, panel stacking).
@@ -57,4 +65,4 @@ pip install -r requirements.txt
 streamlit run app.py
 ```
 
-For real data locally, put `database_url` and `attendance_password` in `.streamlit/secrets.toml` (git-ignored).
+For real data locally, put `database_url`, `attendance_password` and `admin_password` in `.streamlit/secrets.toml` (git-ignored).
