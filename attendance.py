@@ -1286,8 +1286,9 @@ def page_members():
         return
     demo_note(store)
     pending = store.count_pending()
-    tab_list, tab_signups, tab_add, tab_import, tab_activity, tab_setup = st.tabs(
-        ["Register", f"Sign-ups ({pending})" if pending else "Sign-ups", "Add person", "Import CSV", "Activity", "Setup"])
+    names = ["Register", f"Sign-ups ({pending})" if pending else "Sign-ups", "Add person", "Import CSV", "Activity"]
+    tabs = st.tabs(names + (["Setup"] if store.demo else []))  # Setup is only needed before a database is connected
+    tab_list, tab_signups, tab_add, tab_import, tab_activity = tabs[:5]
 
     with tab_activity:
         activity_panel(store)
@@ -1333,8 +1334,9 @@ def page_members():
                 n = store.upsert_members(rows)
                 st.success(f"Imported {n} people." + (" (Demo store — this resets when the app restarts.)" if store.demo else ""))
 
-    with tab_setup:
-        st.markdown(SETUP_GUIDE)
+    if store.demo:
+        with tabs[5]:
+            st.markdown(SETUP_GUIDE)
 
 
 ACTIVITY_LABELS = {"tick": "Ticked in", "untick": "Unticked", "edit": "Edited", "add_person": "Added",
