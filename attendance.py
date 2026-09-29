@@ -722,6 +722,12 @@ def checkin_panel(store):
 
 
 # ---------------------------------------------------------------- dashboard (home)
+def fmt_date(v, fmt: str = "%d %b", empty: str = "Not yet") -> str:
+    """Date → text; blank, None, NaN or unparseable values become `empty` (people never ticked in have no date)."""
+    d = pd.to_datetime(v, errors="coerce") if v is not None and not (isinstance(v, float) and np.isnan(v)) else pd.NaT
+    return empty if pd.isna(d) else d.strftime(fmt)
+
+
 def _esc(v) -> str:
     import html
     return html.escape(str(v or ""))
@@ -854,7 +860,7 @@ def page_dashboard():
                         f'<tr><td><span class="dot {r.level}"></span>{_esc(r.name)}</td>'
                         f'<td><span class="pill {"red" if r.level == "red" else "amber"}">'
                         f'{"Red" if r.level == "red" else "Yellow"} · {r.missed} missed</span></td>'
-                        f'<td>{_esc(pd.to_datetime(r.last_seen).strftime("%d %b") if r.last_seen else "Not yet")}</td>'
+                        f'<td>{_esc(fmt_date(r.last_seen))}</td>'
                         f'<td class="muted">{_esc(r.phone) or "—"}</td></tr>' for r in need.itertuples())
                     st.html(f'<table class="dash-table"><thead><tr><th>Name</th><th>Status</th><th>Last seen</th>'
                             f'<th>Phone</th></tr></thead><tbody>{trs}</tbody></table>')
@@ -930,7 +936,7 @@ def followup_panel(store):
                 "Yellow only": df[df.level == "yellow"], "Everyone": df}[show]
         table = pd.DataFrame({
             "Status": view.level.map(LEVEL_LABEL), "Name": view.name, "Missed in a row": view.missed,
-            "Last seen": pd.to_datetime(view.last_seen).dt.strftime("%d %b %Y").fillna("Not yet"),
+            "Last seen": pd.to_datetime(view.last_seen, errors="coerce").dt.strftime("%d %b %Y").fillna("Not yet"),
             "Attendance": view.rate, "Phone": view.phone, "Group": view.group,
             "Type": view.type.map({"member": "Member", "first_timer": "First-timer"}).fillna(view.type),
             "Invited by": view.invited_by})

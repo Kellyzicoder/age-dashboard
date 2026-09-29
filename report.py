@@ -73,7 +73,7 @@ def gather(store, day: dt.date | None = None) -> dict:
     df = A.missed_streaks(members, services, day)
     follow = [] if df.empty else [
         dict(Status="Red" if r.level == "red" else "Yellow", Name=r.name, **{"Missed in a row": int(r.missed)},
-             **{"Last seen": pd.to_datetime(r.last_seen).strftime("%d %b %Y") if r.last_seen else "Not yet"},
+             **{"Last seen": A.fmt_date(r.last_seen, "%d %b %Y")},
              Phone=r.phone, Group=r.group, **{"Invited by": r.invited_by})
         for r in df[df.level != "ok"].itertuples()]
 
@@ -203,7 +203,7 @@ def build(store, day: dt.date | None = None) -> dict:
         f'<tr><td style="padding:0 0 10px"><table role="presentation" width="100%" cellspacing="0" cellpadding="0">{tiles}'
         f"</table></td></tr>"
         + _section(f"Needs a follow-up call ({need})" + (f" · {d['red']} red, {d['yellow']} yellow" if need else ""),
-                   _table([{**f, "Last seen": f["Last seen"][:6], "Missed": f["Missed in a row"]} for f in d["follow"]],
+                   _table([{**f, "Last seen": f["Last seen"] if f["Last seen"] == "Not yet" else f["Last seen"][:6], "Missed": f["Missed in a row"]} for f in d["follow"]],
                           ["Status", "Name", "Missed", "Last seen", "Phone"],
                           "Nobody has missed 3 or more services in a row."))
         + _section(f"Welcome-form sign-ups waiting ({len(d['signups'])})",
