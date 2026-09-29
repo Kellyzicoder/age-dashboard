@@ -10,11 +10,20 @@ Tables (same in SQLite and Postgres):
           invited_by, follow_up, created_at)
   services(service_date PRIMARY KEY, name)
   attendance(service_date, member_id, checked_at, PRIMARY KEY (service_date, member_id))
+  activity_log(id, at, kind, service_date, member_id, detail, by_name, result)   -- append-only history
+
+Safe when several people use it at once (the same ideas banks use):
+  • ticks are "make this person present / absent" requests, so repeating one changes nothing;
+  • an untick only goes through if the tick is still the one that usher saw (optimistic check);
+  • approving a sign-up is one all-or-nothing transaction that only the first admin can win;
+  • each member row has a version number, so a stale edit is refused instead of overwriting someone else;
+  • every change is written to activity_log, which is only ever added to.
 """
 from __future__ import annotations
 
 import datetime as dt
 import re
+from contextlib import contextmanager
 import threading
 import uuid
 from zoneinfo import ZoneInfo
@@ -69,10 +78,16 @@ SCHEMA = [
     "CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)",
     """CREATE TABLE IF NOT EXISTS email_log (
         id TEXT PRIMARY KEY, kind TEXT, report_date DATE, sent_at TEXT, recipients TEXT, ok BOOLEAN, detail TEXT)""",
+    """CREATE TABLE IF NOT EXISTS activity_log (
+        id TEXT PRIMARY KEY, at TEXT NOT NULL, kind TEXT NOT NULL, service_date DATE, member_id TEXT,
+        detail TEXT, by_name TEXT, result TEXT)""",
+    "CREATE INDEX IF NOT EXISTS activity_log_at ON activity_log(at)",
 ]
+# Columns added after launch. Postgres skips ones that exist; SQLite reports "duplicate column", which is ignored.
+MIGRATIONS = ["ALTER TABLE members ADD COLUMN {ine}version INTEGER NOT NULL DEFAULT 1"]
 # Postgres only: lock the app's tables so the public (publishable) key used by the welcome form can't read them.
 PG_SECURITY = [f"ALTER TABLE {t} ENABLE ROW LEVEL SECURITY"
-               for t in ("members", "services", "attendance", "settings", "email_log")]
+               for t in ("members", "services", "attendance", "settings", "email_log", "activity_log")]
 # Sign-ups from the public welcome form. On Postgres this table is created by the setup SQL (Members → Setup),
 # because it needs Row Level Security and a UUID default; here it only exists for the SQLite demo.
 DEMO_REGISTRATIONS = """CREATE TABLE IF NOT EXISTS registrations (
@@ -91,6 +106,10 @@ def _txt(v) -> str:
 
 class DbUnavailable(Exception):
     """The database can't be reached right now. Carries a plain-English reason for the page to show."""
+
+
+class AlreadyHandled(Exception):
+    """Someone else got there first (e.g. another admin already approved this sign-up)."""
 
 
 def _friendly(err: Exception) -> str:
@@ -121,6 +140,8 @@ class SqlStore:
         self._lock = threading.RLock()
         self._conn = None
         self._cache = {}
+        self._in_tx = False
+        self.versioned = False  # set by _ensure_schema once the members.version column is known to exist
         self._wrote = {}  # service date -> time of the last tick/untick, so a poll never shows an older read
         self._schema_ready = False
         self._down_until = 0.0
@@ -137,6 +158,16 @@ class SqlStore:
         if not self._schema_ready:
             for stmt in SCHEMA + ([DEMO_REGISTRATIONS] if self.demo else []):
                 self._raw(stmt)
+            self.versioned = True
+            for stmt in MIGRATIONS:  # best effort: without the version column, edits simply aren't version-checked
+                try:
+                    self._raw(stmt.format(ine="" if self.demo else "IF NOT EXISTS "))
+                except Exception as e:
+                    if "duplicate column" in str(e).lower():
+                        continue
+                    if type(e).__name__ == "OperationalError":
+                        raise
+                    self.versioned = False
             if not self.demo:
                 import psycopg
                 for stmt in PG_SECURITY:  # best effort: never block the app if the role can't alter a table
@@ -195,7 +226,7 @@ class SqlStore:
         if fetch:
             cols = [d[0] for d in cur.description]
             return [dict(zip(cols, r)) for r in cur.fetchall()]
-        return None
+        return cur.rowcount  # rows changed: 0 means a conditional write found nothing to change
 
     def _exec(self, sql, params=(), many=False, fetch=False):
         if self.demo:
@@ -204,7 +235,9 @@ class SqlStore:
         import psycopg
         with self._lock:
             self._check_up()
-            for attempt in (1, 2):  # one quiet reconnect if the server dropped an idle connection
+            # one quiet reconnect if the server dropped an idle connection (never inside a transaction:
+            # a new connection would silently run the rest outside it)
+            for attempt in ((2,) if self._in_tx else (1, 2)):
                 try:
                     self._ensure_schema()
                     out = self._raw(sql, params, many, fetch)
@@ -225,6 +258,46 @@ class SqlStore:
                     if attempt == 2:
                         self._mark_down(e)
                         raise DbUnavailable(self.last_error) from e
+
+    @contextmanager
+    def transaction(self):
+        """All-or-nothing block: every write inside commits together, or none do. Nested calls join the outer one."""
+        with self._lock:
+            if self._in_tx:
+                yield
+                return
+            self._exec("SELECT 1")  # connect (and reconnect if needed) before starting
+            self._conn.execute("BEGIN")
+            self._in_tx = True
+            try:
+                yield
+            except BaseException:
+                self._in_tx = False
+                try:
+                    self._conn.execute("ROLLBACK")
+                except Exception:
+                    self._conn = None  # connection is gone, and the server drops the half-done work with it
+                raise
+            self._in_tx = False
+            try:
+                self._conn.execute("COMMIT")
+            except Exception as e:
+                self._conn = None
+                self._mark_down(e)
+                raise DbUnavailable(self.last_error) from e
+
+    def log(self, kind: str, detail: str = "", member_id: str | None = None, service_date: str | None = None,
+            by: str = "", result: str = "done"):
+        """Add a line to the append-only activity log (never updated or deleted by the app)."""
+        self._exec("INSERT INTO activity_log (id, at, kind, service_date, member_id, detail, by_name, result) "
+                   "VALUES (?, ?, ?, ?, ?, ?, ?, ?)",
+                   (new_id(), now_iso(), kind, service_date or None, member_id, detail[:500], by[:80], result))
+
+    def activity(self, day: str | None = None, limit: int = 300) -> list[dict]:
+        where, params = ("WHERE service_date = ? OR substr(at, 1, 10) = ?", (day, day)) if day else ("", ())
+        rows = self._exec(f"SELECT at, kind, service_date, member_id, detail, by_name, result FROM activity_log "
+                          f"{where} ORDER BY at DESC LIMIT {int(limit)}", params, fetch=True)
+        return [{k: _txt(v) for k, v in r.items()} for r in rows]
 
     def _cached(self, key, ttl, fn):
         now = dt.datetime.now().timestamp()
@@ -280,15 +353,35 @@ class SqlStore:
                    "ON CONFLICT (service_date) DO UPDATE SET name = excluded.name", (date, name or "Service"))
         self._touched(date)
 
-    def set_present(self, date: str, mid: str, present: bool, name: str = "Sunday Service"):
-        if present:
-            self._exec("INSERT INTO services (service_date, name) VALUES (?, ?) ON CONFLICT (service_date) DO NOTHING",
-                       (date, name))
-            self._exec("INSERT INTO attendance (service_date, member_id, checked_at) VALUES (?, ?, ?) "
-                       "ON CONFLICT (service_date, member_id) DO NOTHING", (date, mid, now_iso()))
-        else:
-            self._exec("DELETE FROM attendance WHERE service_date = ? AND member_id = ?", (date, mid))
+    def set_present(self, date: str, mid: str, present: bool, name: str = "Sunday Service",
+                    seen: str | None = None, by: str = "") -> str:
+        """Make this person present or absent. Returns 'done', 'already' (it was already that way) or 'changed'.
+
+        A tick is a target state, so doing it twice changes nothing. An untick with `seen` (the check-in time the
+        usher was looking at) only removes that exact tick: if another phone unticked and re-ticked the person
+        meanwhile, it returns 'changed' and leaves the newer tick alone.
+        """
+        with self.transaction():
+            if present:
+                self._exec("INSERT INTO services (service_date, name) VALUES (?, ?) "
+                           "ON CONFLICT (service_date) DO NOTHING", (date, name))
+                n = self._exec("INSERT INTO attendance (service_date, member_id, checked_at) VALUES (?, ?, ?) "
+                               "ON CONFLICT (service_date, member_id) DO NOTHING", (date, mid, now_iso()))
+                result = "done" if n else "already"
+            else:
+                sql, args = "DELETE FROM attendance WHERE service_date = ? AND member_id = ?", [date, mid]
+                if seen:
+                    sql, args = sql + " AND checked_at = ?", args + [seen]
+                n = self._exec(sql, tuple(args))
+                if n:
+                    result = "done"
+                else:
+                    still = self._exec("SELECT 1 AS x FROM attendance WHERE service_date = ? AND member_id = ?",
+                                       (date, mid), fetch=True)
+                    result = "changed" if still else "already"
+            self.log("tick" if present else "untick", "", mid, date, by, result)
         self._touched(date)
+        return result
 
     def _touched(self, date: str):
         import time
@@ -312,14 +405,19 @@ class SqlStore:
             self._exec(f"INSERT INTO members ({cols}) VALUES ({marks}) ON CONFLICT (id) DO NOTHING",
                        [[mid] + vals for mid, vals in inserts], many=True)
         if updates:  # only overwrite fields that were provided; COALESCE keeps what's already stored
-            sets = ", ".join(f"{c} = COALESCE(?, {c})" for c in MEMBER_COLS)
+            sets = ", ".join(f"{c} = COALESCE(?, {c})" for c in MEMBER_COLS) + (", version = version + 1" if self.versioned else "")
             self._exec(f"UPDATE members SET {sets} WHERE id = ?", [vals + [mid] for mid, vals in updates], many=True)
         self._cache.pop("members", None)
         return len(rows)
 
-    def update_members(self, changes: dict[str, dict]) -> int:
-        """Set exact values (blanks allowed) for edited members — used by the editable register."""
-        n = 0
+    def update_members(self, changes: dict[str, dict], versions: dict[str, int] | None = None,
+                       by: str = "") -> tuple[list[str], list[str]]:
+        """Save edits from the register. Returns (saved ids, conflicting ids).
+
+        Optimistic locking: with `versions` (each row's version when the editor opened), a row is only saved if
+        nobody else has changed it since. Otherwise it is left alone and reported as a conflict.
+        """
+        saved, conflicts = [], []
         for mid, fields in changes.items():
             fields = dict(fields)
             if "group" in fields:
@@ -328,10 +426,20 @@ class SqlStore:
             if not cols:
                 continue
             vals = [None if (fields[c] in ("", None) and c in ("date_joined", "first_visit")) else fields[c] for c in cols]
-            self._exec(f"UPDATE members SET {', '.join(f'{c} = ?' for c in cols)} WHERE id = ?", vals + [mid])
-            n += 1
+            bump = ", version = version + 1" if self.versioned else ""
+            sql = f"UPDATE members SET {', '.join(f'{c} = ?' for c in cols)}{bump} WHERE id = ?"
+            args = vals + [mid]
+            if self.versioned and versions and versions.get(mid) not in (None, ""):
+                sql, args = sql + " AND version = ?", args + [int(versions[mid])]
+            with self.transaction():
+                if self._exec(sql, tuple(args)):
+                    saved.append(mid)
+                    self.log("edit", ", ".join(c.replace("group_name", "group") for c in cols), mid, None, by)
+                else:
+                    conflicts.append(mid)
+                    self.log("edit", ", ".join(cols), mid, None, by, "changed")
         self._cache.pop("members", None)
-        return n
+        return saved, conflicts
 
     # -- sign-ups from the welcome form
     def list_registrations(self, status: str = "pending") -> list[dict] | None:
@@ -356,28 +464,47 @@ class SqlStore:
         regs = self._cached("pending", 30, lambda: self.list_registrations("pending"))
         return len(regs or [])
 
-    def resolve_registration(self, reg_id: str, status: str, member_id: str | None = None):
-        self._exec("UPDATE registrations SET status = ?, member_id = ? WHERE CAST(id AS TEXT) = ?",
-                   (status, member_id, str(reg_id)))
+    def resolve_registration(self, reg_id: str, status: str, by: str = "") -> bool:
+        """Reject (or otherwise close) a pending sign-up. False if someone else already handled it."""
+        with self.transaction():
+            n = self._exec("UPDATE registrations SET status = ? WHERE CAST(id AS TEXT) = ? AND status = 'pending'",
+                           (status, str(reg_id)))
+            self.log("signup_" + status, "", None, None, by, "done" if n else "already")
         self._cache.pop("pending", None)
+        return bool(n)
 
-    def approve_registration(self, reg: dict, match_id: str | None = None, check_in: bool = True) -> str:
-        """Add the sign-up to the register (or fill gaps on the matched person), optionally tick them present."""
+    def approve_registration(self, reg: dict, match_id: str | None = None, check_in: bool = True,
+                             by: str = "") -> str:
+        """Add the sign-up to the register (or fill gaps on the matched person), optionally tick them present.
+
+        One all-or-nothing transaction. It starts by claiming the sign-up ('pending' → 'approved'); if two admins
+        press Approve together, the database lets only one claim succeed and the other gets AlreadyHandled,
+        so nobody is added twice. If anything fails part-way, the sign-up goes back to pending untouched.
+        """
         visit = reg.get("first_visit") or today().isoformat()
         fields = dict(full_name=" ".join(reg["full_name"].split()), phone=reg.get("phone", "").strip(),
                       email=reg.get("email", "").strip(), invited_by=reg.get("invited_by", "").strip())
-        if match_id:  # existing person: only fill in what the form provided, never blank anything
-            self.upsert_members([dict(id=match_id, **{k: v for k, v in fields.items() if v and k != "full_name"})])
-            mid = match_id
-        else:
-            mid = new_id()
-            note = reg.get("notes", "").strip()
-            follow = "Welcome form" + ("" if reg.get("wants_contact", True) else " · prefers no contact")
-            self.upsert_members([dict(id=mid, **fields, type="first_timer", status="", first_visit=visit,
-                                      follow_up=follow + (f" · {note}" if note else ""), created_at=now_iso())])
-        if check_in:
-            self.set_present(visit, mid, True)
-        self.resolve_registration(reg["id"], "approved", mid)
+        try:
+            with self.transaction():
+                if not self._exec("UPDATE registrations SET status = 'approved' "
+                                  "WHERE CAST(id AS TEXT) = ? AND status = 'pending'", (str(reg["id"]),)):
+                    raise AlreadyHandled(reg.get("full_name", ""))
+                if match_id:  # existing person: only fill in what the form provided, never blank anything
+                    self.upsert_members([dict(id=match_id, **{k: v for k, v in fields.items() if v and k != "full_name"})])
+                    mid = match_id
+                else:
+                    mid = new_id()
+                    note = reg.get("notes", "").strip()
+                    follow = "Welcome form" + ("" if reg.get("wants_contact", True) else " · prefers no contact")
+                    self.upsert_members([dict(id=mid, **fields, type="first_timer", status="", first_visit=visit,
+                                              follow_up=follow + (f" · {note}" if note else ""), created_at=now_iso())])
+                if check_in:
+                    self.set_present(visit, mid, True, by=by)
+                self._exec("UPDATE registrations SET member_id = ? WHERE CAST(id AS TEXT) = ?", (mid, str(reg["id"])))
+                self.log("signup_approved", "matched existing person" if match_id else "new first-timer", mid, None, by)
+        finally:
+            self._cache.pop("pending", None)
+            self._cache.pop("members", None)
         return mid
 
     # -- settings & email log (daily report)
@@ -697,6 +824,13 @@ def gate(store, admin: bool = False) -> bool:
     return False
 
 
+def actor(store) -> str:
+    """Name for the activity log: the name typed on the check-in tab, plus the sign-in type."""
+    who = "Admin" if is_admin(store) else "Team"
+    name = " ".join(str(st.session_state.get("by_name", "")).split())[:40]
+    return f"{name} ({who})" if name else who
+
+
 def account_box(store):
     """Sidebar: who is signed in, and a sign-out button."""
     if store.demo or not role(store):
@@ -729,26 +863,39 @@ def demo_note(store):
 def checkin_panel(store):
     """Ushers tick people as they arrive; ticks from every phone sync within seconds."""
     _, per_row = layout_prefs(names=True)
-    c1, c2, c3 = st.columns([1, 2, 2], vertical_alignment="bottom")
+    c1, c2, c3, c4 = st.columns([1.1, 1.5, 2, 1.5], vertical_alignment="bottom")
     day = c1.date_input("Service date", value=today(), format="DD/MM/YYYY")
     svc_name = c2.text_input("Service", value="Sunday Service")
     q = c3.text_input("Find a person", placeholder="Type a name…", key="ci_q")
+    st.session_state.setdefault("ci_by", st.session_state.get("by_name", ""))
+    c4.text_input("Your name", placeholder="Optional", key="ci_by", max_chars=40,
+                  on_change=lambda: st.session_state.update(by_name=st.session_state.ci_by),
+                  help="Shown next to your ticks in the admins' activity log.")
     date = day.isoformat()
+    seen_key = f"ci_seen_{date}"  # the check-in times this phone is showing, for safe unticks
 
     members = sorted(store.list_members(), key=lambda m: norm(m.get("full_name", "")))
     members = [m for m in members if norm(m.get("status", "")) not in INACTIVE]
 
     def on_tick(mid):
+        present = bool(st.session_state[f"ci_{date}_{mid}"])
+        seen = None if present else st.session_state.get(seen_key, {}).get(mid)
         try:
-            store.set_present(date, mid, bool(st.session_state[f"ci_{date}_{mid}"]), svc_name)
+            result = store.set_present(date, mid, present, svc_name, seen=seen, by=actor(store))
         except DbUnavailable:
             st.toast("Not saved — can't reach the database right now.", icon=":material/cloud_off:")
+            return
+        if result == "changed":
+            who = next((m["full_name"] for m in members if m["id"] == mid), "That person")
+            st.toast(f"{who} was just ticked in again on another phone, so they're still ticked.",
+                     icon=":material/sync_problem:")
 
     @st.fragment(run_every=3)
     @db_safe
     def live_list():
         s = store.get_service(date) or {}
         present = s.get("present") or {}
+        st.session_state[seen_key] = dict(present)
         shown = [m for m in members if not q or norm(q) in norm(m.get("full_name", ""))]
         k = st.columns(3)
         k[0].metric("Checked in", f"{len(present)}", border=True)
@@ -779,7 +926,8 @@ def checkin_panel(store):
                 store.upsert_members([dict(id=mid, full_name=" ".join(name.split()), phone=phone.strip(),
                                            invited_by=invited.strip(), type="first_timer", first_visit=date,
                                            status="", created_at=now_iso())])
-                store.set_present(date, mid, True, svc_name)
+                store.set_present(date, mid, True, svc_name, by=actor(store))
+                store.log("add_person", "first-timer added on check-in", mid, date, actor(store))
                 st.success(f"Welcome, {name.strip()}! Checked in.")
                 st.rerun()
 
@@ -1053,6 +1201,7 @@ def register_editor(store):
     for c in EDIT_COLS:
         if c not in m.columns:
             m[c] = ""
+    versions_now = dict(zip(m["id"], m["version"])) if "version" in m.columns else {}
     m = m.set_index("id")[EDIT_COLS].fillna("")
     for c in ("date_joined", "first_visit"):
         m[c] = m[c].map(_as_date)
@@ -1063,8 +1212,15 @@ def register_editor(store):
     view = view.sort_values("full_name", key=lambda s: s.str.lower())
     st.caption(f"{len(view)} of {len(m)} people · click a cell to edit, then **Save changes**. "
                "To take someone off the lists, set Status to Moved/Inactive (their history is kept).")
+    # Optimistic locking: remember each row's version when editing starts; keep it while edits are unsaved.
+    ed_key, snap_key = f"reg_{q}", f"reg_versions_{q}"
+    if not (st.session_state.get(ed_key) or {}).get("edited_rows") or snap_key not in st.session_state:
+        st.session_state[snap_key] = versions_now
+    flash = st.session_state.pop("reg_flash", None)
+    if flash:
+        st.warning(flash, icon=":material/sync_problem:")
     edited = st.data_editor(
-        view, key=f"reg_{q}", hide_index=True, width="stretch", height=520, num_rows="fixed",
+        view, key=ed_key, hide_index=True, width="stretch", height=520, num_rows="fixed",
         column_config={
             "full_name": st.column_config.TextColumn("Name", required=True, max_chars=100),
             "type": st.column_config.SelectboxColumn("Type", options=["member", "first_timer"], required=True),
@@ -1109,9 +1265,16 @@ def register_editor(store):
         elif bad_dates:
             st.error("Dates need to look like 25/12/2025 — check: " + "; ".join(bad_dates[:5]))
         else:
-            n = store.update_members(changes)
-            st.session_state.pop(f"reg_{q}", None)
-            st.toast(f"Saved {n} {'person' if n == 1 else 'people'}.", icon=":material/check_circle:")
+            saved, clashes = store.update_members(changes, st.session_state.get(snap_key), by=actor(store))
+            st.session_state.pop(ed_key, None)
+            st.session_state.pop(snap_key, None)
+            if saved:
+                st.toast(f"Saved {len(saved)} {'person' if len(saved) == 1 else 'people'}.", icon=":material/check_circle:")
+            if clashes:
+                names = ", ".join(str(edited.at[mid, "full_name"]) for mid in clashes[:5])
+                st.session_state.reg_flash = (
+                    f"Not saved: {names}. Someone else changed {'this person' if len(clashes) == 1 else 'these people'} "
+                    "while you were editing. Their latest details are shown now. Please make your change again.")
             st.rerun()
 
 
@@ -1123,8 +1286,11 @@ def page_members():
         return
     demo_note(store)
     pending = store.count_pending()
-    tab_list, tab_signups, tab_add, tab_import, tab_setup = st.tabs(
-        ["Register", f"Sign-ups ({pending})" if pending else "Sign-ups", "Add person", "Import CSV", "Setup"])
+    tab_list, tab_signups, tab_add, tab_import, tab_activity, tab_setup = st.tabs(
+        ["Register", f"Sign-ups ({pending})" if pending else "Sign-ups", "Add person", "Import CSV", "Activity", "Setup"])
+
+    with tab_activity:
+        activity_panel(store)
 
     with tab_list:
         register_editor(store)
@@ -1171,6 +1337,37 @@ def page_members():
         st.markdown(SETUP_GUIDE)
 
 
+ACTIVITY_LABELS = {"tick": "Ticked in", "untick": "Unticked", "edit": "Edited", "add_person": "Added",
+                   "signup_approved": "Approved sign-up", "signup_rejected": "Rejected sign-up"}
+RESULT_LABELS = {"done": "Done", "already": "No change (already done)",
+                 "changed": "Blocked: someone else changed it first"}
+
+
+def activity_panel(store):
+    """Append-only history of every tick, untick, edit and approval: who, what, when."""
+    st.caption("Every change is added here and never edited or deleted, so you can always see who did what. "
+               "“Blocked” means two people acted at the same moment and the app kept the newer change.")
+    a, b, _ = st.columns([1, 1, 2], vertical_alignment="bottom")
+    day = a.date_input("Day", value=today(), format="DD/MM/YYYY", key="act_day")
+    only = b.selectbox("Show", ["Everything", "Check-ins", "Edits & sign-ups", "Blocked only"], key="act_only")
+    rows = store.activity(day.isoformat())
+    names = {m["id"]: m["full_name"] for m in store.list_members()}
+    df = pd.DataFrame([dict(Time=fmt_date(r["at"], "%H:%M:%S", ""), What=ACTIVITY_LABELS.get(r["kind"], r["kind"]),
+                            Person=names.get(r["member_id"], "(removed)" if r["member_id"] else ""),
+                            Details=r["detail"], By=r["by_name"] or "", Result=RESULT_LABELS.get(r["result"], r["result"]),
+                            _kind=r["kind"], _res=r["result"]) for r in rows])
+    if df.empty:
+        st.info("Nothing recorded on this day yet.", icon=":material/history:")
+        return
+    if only == "Check-ins":
+        df = df[df._kind.isin(["tick", "untick"])]
+    elif only == "Edits & sign-ups":
+        df = df[~df._kind.isin(["tick", "untick"])]
+    elif only == "Blocked only":
+        df = df[df._res == "changed"]
+    st.dataframe(df.drop(columns=["_kind", "_res"]), hide_index=True, width="stretch", height=460)
+
+
 def signups(store):
     """Approve or reject sign-ups that came in from the public welcome form."""
     regs = store.list_registrations("pending")
@@ -1205,12 +1402,18 @@ def signups(store):
             a, b, c = st.columns([2, 1, 1], vertical_alignment="center")
             tick = a.checkbox(f"Mark present on {r['first_visit'] or 'today'}", value=True, key=f"reg_ci_{r['id']}")
             if b.button("Approve", key=f"reg_ok_{r['id']}", type="primary", icon=":material/check:", width="stretch"):
-                store.approve_registration(r, match["id"] if match else None, check_in=tick)
-                st.toast(f"{r['full_name']} added to the register.", icon=":material/person_add:")
+                try:
+                    store.approve_registration(r, match["id"] if match else None, check_in=tick, by=actor(store))
+                    st.toast(f"{r['full_name']} added to the register.", icon=":material/person_add:")
+                except AlreadyHandled:
+                    st.toast(f"{r['full_name']} was already handled by another admin, so nothing was added twice.",
+                             icon=":material/info:")
                 st.rerun()
             if c.button("Reject", key=f"reg_no_{r['id']}", icon=":material/close:", width="stretch"):
-                store.resolve_registration(r["id"], "rejected")
-                st.toast(f"Sign-up from {r['full_name']} rejected.")
+                if store.resolve_registration(r["id"], "rejected", by=actor(store)):
+                    st.toast(f"Sign-up from {r['full_name']} rejected.")
+                else:
+                    st.toast(f"{r['full_name']} was already handled by another admin.", icon=":material/info:")
                 st.rerun()
 
 

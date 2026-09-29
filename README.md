@@ -13,7 +13,7 @@ missing and follow up.
 | Follow-up & Check-in | **Needs follow-up** tab: 🟡 yellow = 3–4 services missed in a row, 🔴 red = 5+; red first; CSV download. **Check-in** tab: ushers tick people as they arrive; ticks sync to every phone within ~3 s, and the list updates quietly without flashing; quick "add first-timer" form. |
 | Live | Real-time view of today's check-ins — count, first-timers, arrivals over time, latest arrivals. Refreshes itself; good on a screen during service. |
 | Insights | Attendance per service (members vs first-timers, 4-service average), first-timers per month, first-timer return rate, attendance by group. |
-| Members | The register (editable), sign-ups from the welcome form to approve, add people, and import the Google Sheets CSV exports. |
+| Members | The register (editable), sign-ups from the welcome form to approve, add people, import the Google Sheets CSV exports, and an **Activity** log of every change. |
 | Reports | The daily email to leaders: who gets it (add or remove addresses), a live preview, **Send report now**, the Excel attachment, and a log of every email sent. |
 | SQL | Read-only SQL queries against the database, with ready-made examples; download results. |
 
@@ -24,6 +24,20 @@ missing and follow up.
   team password don't see it at all. If `admin_password` isn't set, the team password opens everything.
 
 The sidebar shows who is signed in and has a **Sign out** button.
+
+**Safe when many people use it at once.** The same ideas banks use for payments:
+
+| Situation | What happens |
+|---|---|
+| Two ushers tick the same person | One tick is kept; ticking is "make present", so repeating it changes nothing. |
+| Someone unticks from an out-of-date screen | The untick only removes the tick that usher was looking at. If another phone re-ticked the person meanwhile, the newer tick stays and the usher gets a message. |
+| Two admins approve the same sign-up | Approving is one all-or-nothing transaction that starts by claiming the sign-up, so only the first admin succeeds and nobody is added twice. If anything fails part-way, the sign-up stays pending. |
+| Two admins edit the same person | Each member has a version number. A save made from a stale screen is refused, and that admin is asked to redo it on the latest details. |
+| Welcome form sent twice (bad signal) | Each sign-up carries its own id, so a resend can't create a second copy. |
+| "Who unticked Grace?" | Members → **Activity** lists every tick, untick, edit and approval with who and when. It is only ever added to. |
+
+Ushers can type their name on the Check-in tab so it shows in the Activity log. The app adds the `activity_log`
+table and the `members.version` column itself; there is no SQL to run.
 
 Dark dashboard theme in the church colours (logo greens and gold). Chart colours are checked for colour-blind
 separation and contrast. The sidebar has **Layout** controls (names per row on Check-in, panel stacking).
